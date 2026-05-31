@@ -2,19 +2,19 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from ta.trend import IchimokuIndicator
+import time  # TAMBAHAN: Modul untuk memberikan jeda waktu
 
-# Konfigurasi halaman web agar lebih lebar
+# Konfigurasi halaman web
 st.set_page_config(page_title="Screener Ichi-Fibo-Heikin", layout="wide")
 st.title("Screener Saham: Ichi-Fibo-Heikin 🚀")
 
 # ==========================================
 # 1. BACA FILE CSV UNTUK DAFTAR EMITEN
 # ==========================================
-@st.cache_data # Cache agar tidak loading CSV berulang kali
+@st.cache_data 
 def load_emiten():
     try:
         df_emiten = pd.read_csv('emiten.csv')
-        # Mengecek apakah ada kolom bernama 'ticker'. Jika tidak ada, ambil kolom pertama.
         if 'ticker' in df_emiten.columns:
             return df_emiten['ticker'].astype(str).tolist()
         else:
@@ -40,8 +40,6 @@ days = st.sidebar.slider("Ambil data berapa hari ke belakang?", 60, 365, 120)
 # ==========================================
 if mode == "Analisis Satuan":
     st.header("Analisis Spesifik")
-    
-    # Dropdown memilih saham dari daftar CSV
     ticker = st.selectbox("Pilih Saham:", daftar_saham)
     
     if st.button("Analisis Saham Ini"):
@@ -51,7 +49,6 @@ if mode == "Analisis Satuan":
             if df.empty:
                 st.error("Data saham tidak tersedia di Yahoo Finance.")
             else:
-                # -- Hitung Ichimoku --
                 ichi = IchimokuIndicator(high=df['High'].squeeze(), low=df['Low'].squeeze())
                 df['Tenkan'] = ichi.ichimoku_conversion_line()
                 df['Kijun'] = ichi.ichimoku_base_line()
@@ -63,7 +60,6 @@ if mode == "Analisis Satuan":
                 di_atas_awan = close_price > max(terakhir['Senkou_A'].squeeze(), terakhir['Senkou_B'].squeeze())
                 tenkan_cross_kijun = terakhir['Tenkan'].squeeze() > terakhir['Kijun'].squeeze()
                 
-                # Menampilkan hasil dalam 3 kolom agar rapi
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
@@ -95,8 +91,7 @@ if mode == "Analisis Satuan":
 # ==========================================
 elif mode == "Screener Massal (Semua Saham)":
     st.header("Screener Ichimoku Massal")
-    st.write(f"Mencari saham dengan sinyal *Buy* kuat dari total **{len(daftar_saham)} saham** di file CSV.")
-    st.warning("Proses ini memakan waktu beberapa saat. Silakan tunggu bilah progres hingga penuh.")
+    st.write(f"Mencari saham dengan sinyal *Buy* dari **{len(daftar_saham)} saham**. (Ada jeda agar tidak diblokir Yahoo)")
     
     if st.button("Mulai Screening"):
         hasil_screener = []
@@ -107,10 +102,8 @@ elif mode == "Screener Massal (Semua Saham)":
             status_text.text(f"Mengecek {ticker}... ({i+1}/{len(daftar_saham)})")
             
             try:
-                # Ambil data diem-diem
                 df = yf.download(ticker, period=f"{days}d", progress=False)
                 
-                # Syarat minimal hari perdagangan untuk Ichimoku
                 if not df.empty and len(df) > 52: 
                     ichi = IchimokuIndicator(high=df['High'].squeeze(), low=df['Low'].squeeze())
                     tenkan = ichi.ichimoku_conversion_line().iloc[-1]
@@ -119,10 +112,8 @@ elif mode == "Screener Massal (Semua Saham)":
                     senkou_b = ichi.ichimoku_b().iloc[-1]
                     close_price = df['Close'].squeeze().iloc[-1]
                     
-                    # LOGIKA SCREENER: Harga di atas awan Kumo & Tenkan di atas Kijun
                     if (close_price > max(senkou_a, senkou_b)) and (tenkan > kijun):
                         
-                        # Hitung Fibo
                         high_max = df['High'].squeeze().max()
                         low_min = df['Low'].squeeze().min()
                         selisih = high_max - low_min
@@ -132,7 +123,6 @@ elif mode == "Screener Massal (Semua Saham)":
                         cutloss = high_max - (selisih * 0.618)
                         target = high_max 
                         
-                        # Hitung Heikin Ashi sederhana
                         ha_close = (df['Open'].squeeze() + df['High'].squeeze() + df['Low'].squeeze() + df['Close'].squeeze()) / 4
                         if ha_close.iloc[-1] > ha_close.iloc[-2]:
                             ha_status = "🟢 HOLD"
@@ -148,19 +138,22 @@ elif mode == "Screener Massal (Semua Saham)":
                             "Sinyal HA": ha_status
                         })
             except Exception:
-                pass # Abaikan saham yang datanya tidak lengkap/error
+                pass 
             
             # Update Progress Bar
             progress_bar.progress((i + 1) / len(daftar_saham))
             
+            # PERBAIKAN: Beri napas 0.3 detik setiap selesai 1 saham agar tidak error "Rate Limit"
+            time.sleep(0.3) 
+            
         status_text.text("Screening Selesai!")
         
-        # Tampilkan Tabel
         if hasil_screener:
             st.success(f"🎉 Ketemu! Ada {len(hasil_screener)} saham yang masuk kriteria Uptrend Ichimoku.")
             df_hasil = pd.DataFrame(hasil_screener)
-            # Menampilkan index dari 1
             df_hasil.index = df_hasil.index + 1 
-            st.dataframe(df_hasil, use_container_width=True)
+            
+            # PERBAIKAN: Penulisan Streamlit terbaru untuk ukuran tabel
+            st.dataframe(df_hasil, width='stretch') 
         else:
             st.error("Tidak ada saham yang memenuhi kriteria Uptrend saat ini.")
