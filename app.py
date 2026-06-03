@@ -1571,110 +1571,128 @@ if "Analisis" in mode:
 
     c1, c2 = st.columns([4, 1])
     with c1:
-        ticker = st.selectbox("Saham", daftar_saham, label_visibility="collapsed")
+        ticker = st.selectbox("Saham", daftar_saham, label_visibility="collapsed",
+                              key="analisis_ticker")
     with c2:
-        run = st.button("Analisis ▶", use_container_width=True, type="primary")
+        run = st.button("Analisis ▶", use_container_width=True, type="primary",
+                        key="analisis_run")
+
+    # Reset cache kalau ticker berubah
+    if st.session_state.get("_analisis_last_ticker") != ticker:
+        st.session_state["_analisis_h"]   = None
+        st.session_state["_analisis_sig"] = None
+        st.session_state["_analisis_hc"]  = None
 
     if run:
         with st.spinner(f"Menganalisis {ticker}…"):
-            h = analyse(ticker, days)
-
-        if not h:
+            h_new = analyse(ticker, days)
+        if not h_new:
             st.error("Data tidak cukup atau ticker tidak valid.")
         else:
-            # Health check
+            sig_new = build_plan(h_new)
+            hc_new  = None
             if use_health:
                 df_hc = download_one(ticker)
-                hc = health_check(df_hc, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
-                if not hc.lolos:
-                    st.warning(f"⚠️ **Health Check:** {hc.alasan}")
-                    for f in hc.flags:
-                        st.markdown(f"- {f}")
-                    st.info("Analisis tetap ditampilkan — gunakan dengan ekstra hati-hati.")
+                hc_new = health_check(df_hc, ticker,
+                                      min_price=min_price, min_adv_juta=min_adv_juta)
+            # Simpan ke session_state — tetap ada saat chart di-interact
+            st.session_state["_analisis_h"]            = h_new
+            st.session_state["_analisis_sig"]          = sig_new
+            st.session_state["_analisis_hc"]           = hc_new
+            st.session_state["_analisis_last_ticker"]  = ticker
 
-            sig = build_plan(h)
+    # Render dari session_state — tidak hilang saat widget di-klik
+    h   = st.session_state.get("_analisis_h")
+    sig = st.session_state.get("_analisis_sig")
+    hc  = st.session_state.get("_analisis_hc")
 
-            render_banner(sig, h["harga"])
+    if h and sig:
+        if hc and not hc.lolos:
+            st.warning(f"⚠️ **Health Check:** {hc.alasan}")
+            for fl in hc.flags:
+                st.markdown(f"- {fl}")
+            st.info("Analisis tetap ditampilkan — gunakan dengan ekstra hati-hati.")
 
-            col_l, col_r = st.columns(2)
-            with col_l:
-                st.markdown("#### 🧠 Analisis Konfluensi")
-                for a in sig.alasan:
-                    st.markdown(f"<div style='font-size:0.88rem;padding:3px 0;'>{a}</div>",
-                                unsafe_allow_html=True)
-            with col_r:
-                st.markdown("#### 🎯 Action Plan")
-                for a in sig.aksi:
-                    st.markdown(f"<div style='font-size:0.88rem;padding:3px 0;'>{a}</div>",
-                                unsafe_allow_html=True)
+        render_banner(sig, h["harga"])
+
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.markdown("#### 🧠 Analisis Konfluensi")
+            for a in sig.alasan:
+                st.markdown(f"<div style='font-size:0.88rem;padding:3px 0;'>{a}</div>",
+                            unsafe_allow_html=True)
+        with col_r:
+            st.markdown("#### 🎯 Action Plan")
+            for a in sig.aksi:
+                st.markdown(f"<div style='font-size:0.88rem;padding:3px 0;'>{a}</div>",
+                            unsafe_allow_html=True)
+
+        st.divider()
+        st.markdown("#### 📏 Price Ladder")
+        render_price_ladder(h, sig)
+
+        st.divider()
+        tab0, tab1, tab2, tab3, tab4 = st.tabs([
+            "📈 Chart", "☁️ Ichimoku + EMA", "📐 Indikator Momentum",
+            "📊 Volume + HA", "📰 Sentimen Berita"
+        ])
+
+        with tab0:
+            render_charts(ticker, h, ctx="analisis")
+
+        with tab1:
+            d = {
+                "Indikator": ["Tenkan","Kijun","Senkou A","Senkou B","Awan Atas","Awan Bawah","EMA 20","EMA 50","Posisi"],
+                "Nilai": [f"{h['tenkan']:,.0f}", f"{h['kijun']:,.0f}", f"{h['sa']:,.0f}",
+                          f"{h['sb']:,.0f}", f"{h['awan_hi']:,.0f}", f"{h['awan_lo']:,.0f}",
+                          f"{h['ema20']:,.0f}", f"{h['ema50']:,.0f}",
+                          "✅ Di atas awan" if h["di_atas"] else "⚠️ Dalam awan" if h["di_dalam"] else "❌ Di bawah awan"],
+            }
+            st.dataframe(pd.DataFrame(d), hide_index=True, use_container_width=True)
+
+        with tab2:
+            d2 = {
+                "Indikator": ["MACD Histogram","ADX","RSI (14)","StochRSI K","StochRSI D","ATR (14)","ATR %"],
+                "Nilai": [f"{h['macd_hist']:+.3f}", f"{h['adx']:.1f}", f"{h['rsi']:.1f}",
+                          f"{h['srsi_k']:.1f}", f"{h['srsi_d']:.1f}", f"{h['atr']:.2f}", f"{h['atr_pct']:.2f}%"],
+                "Status": [
+                    "🚀 Cross UP!" if h["macd_cross_up"] else ("✅ Positif" if h["macd_bull"] else "❌ Negatif"),
+                    "💪 Kuat" if h["adx_strong"] else "➡️ Lemah",
+                    "🔥 Overbought" if h["rsi"]>70 else ("💧 Oversold" if h["rsi"]<30 else "📊 Normal"),
+                    "🔥 OB" if h["srsi_overbought"] else ("💧 OS" if h["srsi_oversold"] else "📊 Normal"),
+                    "─","─","─",
+                ],
+            }
+            st.dataframe(pd.DataFrame(d2), hide_index=True, use_container_width=True)
+
+        with tab3:
+            m1,m2,m3,m4 = st.columns(4)
+            m1.metric("Volume Rel.", f"{h['vol_rel']:.2f}×", delta="Tinggi" if h["vol_rel"]>1.5 else None)
+            m2.metric("VWAP 20d", f"{h['vwap']:,.0f}")
+            m3.metric("HA Status", f"{'🟢' if h['ha_green'] else '🔴'} {h['ha_seq']} candle")
+            m4.metric("Price vs VWAP", "✅ Di atas" if h["price_above_vwap"] else "⚠️ Di bawah")
 
             st.divider()
-            st.markdown("#### 📏 Price Ladder")
-            render_price_ladder(h, sig)
+            c1, c2, c3, c4 = st.columns(4)
+            cqs_label = "🏦 Akumulasi" if h["accum_confirm"] else ("🚨 Distribusi!" if h["dist_trap"] else "📊 Normal")
+            c1.metric("CQS (3 candle)", f"{h['cqs']:.2f}", delta=cqs_label)
+            c2.metric("OBV Trend", "✅ Naik" if h["obv_bull"] else "⚠️ Turun")
+            c3.metric("Shooting Star", "⚠️ YA" if h["shooting_star"] else "✅ Tidak")
+            c4.metric("Early Bird Score", f"{h['early_score']}/5")
 
+        with tab4:
+            st.markdown("#### 📰 Sentimen Berita Terkini")
+            st.caption("Diambil real-time via AI web search — cache 1 jam")
+            score_s, label_s = render_sentiment(ticker)
             st.divider()
-            tab0, tab1, tab2, tab3, tab4 = st.tabs([
-                "📈 Chart", "☁️ Ichimoku + EMA", "📐 Indikator Momentum",
-                "📊 Volume + HA", "📰 Sentimen Berita"
-            ])
-
-            with tab0:
-                render_charts(ticker, h, ctx="analisis")
-
-            with tab1:
-                d = {
-                    "Indikator": ["Tenkan","Kijun","Senkou A","Senkou B","Awan Atas","Awan Bawah","EMA 20","EMA 50","Posisi"],
-                    "Nilai": [f"{h['tenkan']:,.0f}", f"{h['kijun']:,.0f}", f"{h['sa']:,.0f}",
-                              f"{h['sb']:,.0f}", f"{h['awan_hi']:,.0f}", f"{h['awan_lo']:,.0f}",
-                              f"{h['ema20']:,.0f}", f"{h['ema50']:,.0f}",
-                              "✅ Di atas awan" if h["di_atas"] else "⚠️ Dalam awan" if h["di_dalam"] else "❌ Di bawah awan"],
-                }
-                st.dataframe(pd.DataFrame(d), hide_index=True, use_container_width=True)
-
-            with tab2:
-                d2 = {
-                    "Indikator": ["MACD Histogram","ADX","RSI (14)","StochRSI K","StochRSI D","ATR (14)","ATR %"],
-                    "Nilai": [f"{h['macd_hist']:+.3f}", f"{h['adx']:.1f}", f"{h['rsi']:.1f}",
-                              f"{h['srsi_k']:.1f}", f"{h['srsi_d']:.1f}", f"{h['atr']:.2f}", f"{h['atr_pct']:.2f}%"],
-                    "Status": [
-                        "🚀 Cross UP!" if h["macd_cross_up"] else ("✅ Positif" if h["macd_bull"] else "❌ Negatif"),
-                        "💪 Kuat" if h["adx_strong"] else "➡️ Lemah",
-                        "🔥 Overbought" if h["rsi"]>70 else ("💧 Oversold" if h["rsi"]<30 else "📊 Normal"),
-                        "🔥 Overbought" if h["srsi_overbought"] else ("💧 Oversold" if h["srsi_oversold"] else "📊 Normal"),
-                        "─","─","─",
-                    ],
-                }
-                st.dataframe(pd.DataFrame(d2), hide_index=True, use_container_width=True)
-
-            with tab3:
-                m1,m2,m3,m4 = st.columns(4)
-                m1.metric("Volume Rel.", f"{h['vol_rel']:.2f}×", delta="Tinggi" if h["vol_rel"]>1.5 else None)
-                m2.metric("VWAP 20d", f"{h['vwap']:,.0f}")
-                m3.metric("HA Status", f"{'🟢' if h['ha_green'] else '🔴'} {h['ha_seq']} candle")
-                m4.metric("Price vs VWAP", "✅ Di atas" if h["price_above_vwap"] else "⚠️ Di bawah")
-
-                st.divider()
-                c1, c2, c3, c4 = st.columns(4)
-                cqs_label = "🏦 Akumulasi" if h["accum_confirm"] else ("🚨 Distribusi!" if h["dist_trap"] else "📊 Normal")
-                c1.metric("CQS (3 candle)", f"{h['cqs']:.2f}", delta=cqs_label)
-                c2.metric("OBV Trend", "✅ Naik" if h["obv_bull"] else "⚠️ Turun")
-                c3.metric("Shooting Star", "⚠️ YA" if h["shooting_star"] else "✅ Tidak")
-                c4.metric("Early Bird Score", f"{h['early_score']}/5")
-
-            with tab4:
-                st.markdown("#### 📰 Sentimen Berita Terkini")
-                st.caption("Diambil real-time via AI web search — cache 1 jam")
-                score_s, label_s = render_sentiment(ticker)
-                # Pengaruh ke sinyal
-                st.divider()
-                if score_s >= 1 and "BUY" in sig.sinyal:
-                    st.success("✅ Sentimen berita MENDUKUNG sinyal teknikal — konfluensi lebih kuat")
-                elif score_s <= -1 and "BUY" in sig.sinyal:
-                    st.warning("⚠️ Sentimen berita BERTENTANGAN dengan sinyal teknikal — pertimbangkan sizing lebih kecil")
-                elif score_s <= -1:
-                    st.error("🔴 Sentimen negatif memperkuat sinyal SELL/WAIT")
-                else:
-                    st.info("➡️ Sentimen netral — keputusan berdasarkan teknikal saja")
+            if score_s >= 1 and "BUY" in sig.sinyal:
+                st.success("✅ Sentimen berita MENDUKUNG sinyal teknikal — konfluensi lebih kuat")
+            elif score_s <= -1 and "BUY" in sig.sinyal:
+                st.warning("⚠️ Sentimen berita BERTENTANGAN dengan sinyal teknikal — pertimbangkan sizing lebih kecil")
+            elif score_s <= -1:
+                st.error("🔴 Sentimen negatif memperkuat sinyal SELL/WAIT")
+            else:
+                st.info("➡️ Sentimen netral — keputusan berdasarkan teknikal saja")
 
 
 # ══════════════════════════════════════════════════════════════
