@@ -1264,21 +1264,245 @@ def render_charts(ticker: str, h: dict):
 
 
 # ══════════════════════════════════════════════════════════════
-# LOAD EMITEN
+# LOAD EMITEN  (support kolom sektor opsional)
 # ══════════════════════════════════════════════════════════════
 @st.cache_data
 def load_emiten():
     try:
         df_e = pd.read_csv("emiten.csv")
         col  = "ticker" if "ticker" in df_e.columns else df_e.columns[0]
-        return df_e[col].astype(str).str.strip().tolist()
+        tickers = df_e[col].astype(str).str.strip().tolist()
+        # Kolom sektor opsional — bisa "sector", "sektor", "industry"
+        sektor_col = next((c for c in df_e.columns
+                           if c.lower() in ["sector","sektor","industry","industri"]), None)
+        sektor_map = {}
+        if sektor_col:
+            sektor_map = dict(zip(df_e[col].astype(str).str.strip(),
+                                  df_e[sektor_col].astype(str).str.strip()))
+        return tickers, sektor_map
     except FileNotFoundError:
-        return []
+        return [], {}
 
-daftar_saham = load_emiten()
+daftar_saham, sektor_map = load_emiten()
 if not daftar_saham:
     st.error("❌ **emiten.csv** tidak ditemukan. Letakkan di folder yang sama.")
     st.stop()
+
+# Fallback sektor map pakai prefix ticker IDX (BBCA→Perbankan, dll)
+IDX_SEKTOR_PREFIX = {
+    "BB":"Perbankan","BT":"Perbankan","BN":"Perbankan","BS":"Perbankan",
+    "TL":"Telekomunikasi","XL":"Telekomunikasi","IS":"Telekomunikasi",
+    "AS":"Asuransi","PR":"Properti","LP":"Properti","PW":"Properti",
+    "CN":"Consumer","MY":"Consumer","UN":"Consumer","CL":"Consumer",
+    "IN":"Industri","KL":"Kimia","TM":"Tambang","AN":"Tambang","IT":"Tambang",
+    "MD":"Media","EM":"Energi","PG":"Energi","AR":"Agribisnis","SA":"Agribisnis",
+}
+def get_sektor(ticker: str) -> str:
+    if ticker in sektor_map:
+        return sektor_map[ticker]
+    prefix = ticker[:2] if len(ticker) >= 2 else ticker
+    return IDX_SEKTOR_PREFIX.get(prefix, "Lainnya")
+
+
+# ══════════════════════════════════════════════════════════════
+# SENTIMENT ENGINE  (Anthropic API — news summary per ticker)
+# ══════════════════════════════════════════════════════════════
+import json, re
+
+@st.cache_data(ttl=3600, show_spinner=False)   # cache 1 jam
+def get_sentiment(ticker: str) -> dict:
+    """
+    Panggil Claude API dengan web_search untuk cari berita terbaru
+    lalu hasilkan sentiment score + ringkasan.
+    """
+    prompt = f"""Kamu adalah analis fundamental saham Indonesia.
+Cari berita terbaru (maks 7 hari terakhir) tentang saham {ticker} di Bursa Efek Indonesia.
+Fokus pada: kinerja keuangan, aksi korporasi, sentimen analis, isu regulasi, berita industri.
+
+Balas HANYA dalam format JSON ini (tanpa markdown, tanpa penjelasan):
+{{
+  "score": <integer -2 hingga +2>,
+  "label": "<VERY POSITIVE|POSITIVE|NEUTRAL|NEGATIVE|VERY NEGATIVE>",
+  "ringkasan": "<1-2 kalimat ringkasan berita utama>",
+  "berita": ["<judul berita 1>", "<judul berita 2>", "<judul berita 3>"],
+  "sumber": "<nama media/sumber>"
+}}
+
+score: +2=sangat positif, +1=positif, 0=netral, -1=negatif, -2=sangat negatif
+Kalau tidak ada berita relevan, score=0, label=NEUTRAL, ringkasan="Tidak ada berita signifikan ditemukan."
+"""
+    try:
+        resp = st.session_state.get("_api_cache_" + ticker)
+        if resp:
+            return resp
+
+        import urllib.request
+        body = json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 500,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read())
+
+        # Ambil text dari response
+        text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text += block.get("text", "")
+
+        # Parse JSON — strip markdown fence kalau ada
+        text = re.sub(r"```json|```", "", text).strip()
+        result = json.loads(text)
+        st.session_state["_api_cache_" + ticker] = result
+        return result
+
+    except Exception as e:
+        return {
+            "score": 0, "label": "NEUTRAL",
+            "ringkasan": f"Gagal mengambil data sentimen: {e}",
+            "berita": [], "sumber": "—"
+        }
+
+
+def render_sentiment(ticker: str):
+    """Tampilkan sentiment card untuk satu ticker."""
+    with st.spinner(f"Menganalisis sentimen berita {ticker}…"):
+        sent = get_sentiment(ticker)
+
+    score  = sent.get("score", 0)
+    label  = sent.get("label", "NEUTRAL")
+    colors = {
+        "VERY POSITIVE": "#00e676", "POSITIVE": "#69f0ae",
+        "NEUTRAL": "#ffc107",
+        "NEGATIVE": "#ff9800", "VERY NEGATIVE": "#f44336",
+    }
+    icons = {
+        "VERY POSITIVE": "🚀", "POSITIVE": "📈",
+        "NEUTRAL": "➡️",
+        "NEGATIVE": "📉", "VERY NEGATIVE": "🔻",
+    }
+    col = colors.get(label, "#ffc107")
+    ico = icons.get(label, "➡️")
+
+    bar_w = int((score + 2) / 4 * 100)   # -2..+2 → 0..100%
+
+    st.markdown(f"""
+    <div style="background:#161b22;border:1px solid {col};border-radius:10px;
+                padding:1rem 1.3rem;margin-bottom:0.8rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-size:1.1rem;font-weight:700;color:{col};">{ico} {label}</span>
+        <span style="font-size:0.78rem;color:#8b949e;">Score: {score:+d} / 2</span>
+      </div>
+      <div style="background:#0b0e17;border-radius:4px;height:6px;margin:8px 0;">
+        <div style="width:{bar_w}%;height:6px;border-radius:4px;background:{col};"></div>
+      </div>
+      <div style="font-size:0.88rem;color:#c9d1d9;margin-top:6px;">{sent.get('ringkasan','')}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    berita = sent.get("berita", [])
+    if berita:
+        st.markdown("**📰 Berita terkait:**")
+        for b in berita:
+            st.markdown(f"- {b}")
+
+    return score, label
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTOR HEATMAP ENGINE
+# ══════════════════════════════════════════════════════════════
+def build_sector_heatmap(hasil: list[dict]) -> go.Figure:
+    """
+    Dari hasil screener, buat heatmap sektor:
+    - Sumbu X: sinyal (STRONG BUY → STRONG SELL)
+    - Tiap sektor: count saham per sinyal
+    - Warna: dominasi sinyal
+    """
+    if not hasil:
+        return None
+
+    df_h = pd.DataFrame(hasil)
+    if "Sektor" not in df_h.columns:
+        return None
+
+    signal_order = ["STRONG BUY", "BUY", "SPEC. BUY", "WAIT", "SELL", "STRONG SELL"]
+    signal_colors = {
+        "STRONG BUY": "#00e676", "BUY": "#4caf50", "SPEC. BUY": "#8bc34a",
+        "WAIT": "#ffc107", "SELL": "#ff9800", "STRONG SELL": "#f44336",
+    }
+
+    sektors = sorted(df_h["Sektor"].unique())
+    pivot   = df_h.groupby(["Sektor", "Sinyal"]).size().unstack(fill_value=0)
+    for sig in signal_order:
+        if sig not in pivot.columns:
+            pivot[sig] = 0
+    pivot = pivot[signal_order]
+
+    # Hitung "bull score" per sektor: weighted sum
+    weights = {"STRONG BUY": 2, "BUY": 1, "SPEC. BUY": 0.5,
+               "WAIT": 0, "SELL": -1, "STRONG SELL": -2}
+    pivot["_bull_score"] = sum(pivot[s] * w for s, w in weights.items())
+    pivot["_total"]      = pivot[signal_order].sum(axis=1)
+    pivot = pivot.sort_values("_bull_score", ascending=True)
+
+    sektors_sorted = pivot.index.tolist()
+    z_data  = []
+    text_data = []
+    for sektor in sektors_sorted:
+        row = []; trow = []
+        for sig in signal_order:
+            cnt = int(pivot.loc[sektor, sig]) if sektor in pivot.index else 0
+            row.append(cnt); trow.append(str(cnt) if cnt > 0 else "")
+        z_data.append(row); text_data.append(trow)
+
+    fig = go.Figure(go.Heatmap(
+        z=z_data,
+        x=signal_order,
+        y=sektors_sorted,
+        text=text_data,
+        texttemplate="%{text}",
+        textfont=dict(size=12, color="white"),
+        colorscale=[
+            [0.0, "#1f0707"], [0.25, "#2e1a0a"],
+            [0.5, "#1a1600"],
+            [0.75, "#081a10"], [1.0, "#071f14"],
+        ],
+        showscale=False,
+        hovertemplate="Sektor: %{y}<br>Sinyal: %{x}<br>Jumlah: %{z}<extra></extra>",
+    ))
+
+    # Annotasi bull score di kanan
+    for i, sektor in enumerate(sektors_sorted):
+        bs = float(pivot.loc[sektor, "_bull_score"])
+        tot = int(pivot.loc[sektor, "_total"])
+        col = "#00e676" if bs > 0 else "#f44336" if bs < 0 else "#ffc107"
+        fig.add_annotation(
+            x=len(signal_order) - 0.3, y=i,
+            text=f"  {bs:+.0f} ({tot})",
+            showarrow=False, xanchor="left",
+            font=dict(size=10, color=col),
+        )
+
+    CT = CHART_THEME
+    fig.update_layout(
+        paper_bgcolor=CT["bg"], plot_bgcolor=CT["bg2"],
+        font=dict(color=CT["text"], size=11),
+        height=max(300, len(sektors_sorted) * 42 + 80),
+        margin=dict(l=120, r=100, t=50, b=60),
+        title=dict(text="Sector Heatmap — distribusi sinyal per sektor", font=dict(size=13), x=0.01),
+        xaxis=dict(side="top", tickfont=dict(size=10)),
+        yaxis=dict(tickfont=dict(size=10)),
+    )
+    return fig
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1290,7 +1514,12 @@ with st.sidebar:
                 unsafe_allow_html=True)
     st.divider()
 
-    mode = st.radio("Mode", ["🔍 Analisis + Plan", "🚀 Screener Massal", "🐦 Early Bird"], label_visibility="collapsed")
+    mode = st.radio("Mode", [
+        "🔍 Analisis + Plan",
+        "🚀 Screener Massal",
+        "🐦 Early Bird",
+        "🌡️ Sector Heatmap",
+    ], label_visibility="collapsed")
     st.divider()
 
     days = st.slider("Lookback Fibonacci (hari)", 30, 365, 120, 10)
@@ -1310,6 +1539,7 @@ with st.sidebar:
     st.caption("Ichimoku · EMA · MACD · ADX · StochRSI")
     st.caption("ATR · VWAP · OBV · CQS · Heikin Ashi")
     st.caption("Fibonacci · Early Bird · Dist. Trap")
+    st.caption("Sector Heatmap · Sentiment AI")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1362,7 +1592,10 @@ if "Analisis" in mode:
             render_price_ladder(h, sig)
 
             st.divider()
-            tab0, tab1, tab2, tab3 = st.tabs(["📈 Chart", "☁️ Ichimoku + EMA", "📐 Indikator Momentum", "📊 Volume + HA"])
+            tab0, tab1, tab2, tab3, tab4 = st.tabs([
+                "📈 Chart", "☁️ Ichimoku + EMA", "📐 Indikator Momentum",
+                "📊 Volume + HA", "📰 Sentimen Berita"
+            ])
 
             with tab0:
                 render_charts(ticker, h)
@@ -1398,6 +1631,200 @@ if "Analisis" in mode:
                 m2.metric("VWAP 20d", f"{h['vwap']:,.0f}")
                 m3.metric("HA Status", f"{'🟢' if h['ha_green'] else '🔴'} {h['ha_seq']} candle")
                 m4.metric("Price vs VWAP", "✅ Di atas" if h["price_above_vwap"] else "⚠️ Di bawah")
+
+                st.divider()
+                c1, c2, c3, c4 = st.columns(4)
+                cqs_label = "🏦 Akumulasi" if h["accum_confirm"] else ("🚨 Distribusi!" if h["dist_trap"] else "📊 Normal")
+                c1.metric("CQS (3 candle)", f"{h['cqs']:.2f}", delta=cqs_label)
+                c2.metric("OBV Trend", "✅ Naik" if h["obv_bull"] else "⚠️ Turun")
+                c3.metric("Shooting Star", "⚠️ YA" if h["shooting_star"] else "✅ Tidak")
+                c4.metric("Early Bird Score", f"{h['early_score']}/5")
+
+            with tab4:
+                st.markdown("#### 📰 Sentimen Berita Terkini")
+                st.caption("Diambil real-time via AI web search — cache 1 jam")
+                score_s, label_s = render_sentiment(ticker)
+                # Pengaruh ke sinyal
+                st.divider()
+                if score_s >= 1 and "BUY" in sig.sinyal:
+                    st.success("✅ Sentimen berita MENDUKUNG sinyal teknikal — konfluensi lebih kuat")
+                elif score_s <= -1 and "BUY" in sig.sinyal:
+                    st.warning("⚠️ Sentimen berita BERTENTANGAN dengan sinyal teknikal — pertimbangkan sizing lebih kecil")
+                elif score_s <= -1:
+                    st.error("🔴 Sentimen negatif memperkuat sinyal SELL/WAIT")
+                else:
+                    st.info("➡️ Sentimen netral — keputusan berdasarkan teknikal saja")
+
+
+# ══════════════════════════════════════════════════════════════
+# MODE 4: SECTOR HEATMAP
+# ══════════════════════════════════════════════════════════════
+elif "Heatmap" in mode:
+    st.markdown("## 🌡️ Sector Heatmap")
+    st.markdown(
+        "<span style='color:#8b949e;font-size:0.85rem;'>"
+        "Lihat sektor mana yang paling banyak sinyal BUY — "
+        "deteksi rotasi sektor & market breadth secara visual"
+        "</span>", unsafe_allow_html=True
+    )
+
+    # Gunakan hasil screener kalau sudah ada, atau jalankan scan cepat
+    if "heatmap_hasil" not in st.session_state: st.session_state.heatmap_hasil = []
+    if "heatmap_raw"   not in st.session_state: st.session_state.heatmap_raw   = {}
+
+    col_b1, col_b2 = st.columns([2, 1])
+    with col_b1:
+        run_hm = st.button("🌡️ Scan Semua Sektor", type="primary", use_container_width=True)
+    with col_b2:
+        if st.button("🔄 Reset", key="hm_reset", use_container_width=True):
+            st.session_state.heatmap_hasil = []; st.session_state.heatmap_raw = {}; st.rerun()
+
+    if run_hm:
+        st.session_state.heatmap_hasil = []; st.session_state.heatmap_raw = {}
+        pbar = st.progress(0, text="Download paralel…")
+        status = st.empty(); holder = st.empty()
+        total = len(daftar_saham); t0 = time.time()
+
+        # Download paralel
+        data_map_hm: dict[str, pd.DataFrame] = {}
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            fut = {ex.submit(download_one, t): t for t in daftar_saham}
+            for f in concurrent.futures.as_completed(fut):
+                t = fut[f]
+                try:    data_map_hm[t] = f.result()
+                except: data_map_hm[t] = pd.DataFrame()
+                done += 1
+                pbar.progress(done/total/2, text=f"⚡ Download: {done}/{total}")
+
+        # Analisis semua (tanpa filter ketat — heatmap butuh semua sinyal)
+        for i, ticker in enumerate(daftar_saham):
+            df_t = data_map_hm.get(ticker, pd.DataFrame())
+            if df_t is None or df_t.empty: continue
+            try:
+                if use_health:
+                    hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
+                    if not hc.lolos: continue
+                h = analyse(ticker, days, df=df_t)
+                if not h: continue
+                sig = build_plan(h)
+                sektor = get_sektor(ticker)
+                st.session_state.heatmap_hasil.append({
+                    "Ticker": ticker, "Sektor": sektor,
+                    "Sinyal": sig.sinyal, "Conf.": sig.confidence,
+                    "Harga": int(round(h["harga"])),
+                })
+                st.session_state.heatmap_raw[ticker] = (h, sig)
+            except: pass
+            pbar.progress(0.5 + (i+1)/total/2, text=f"🧠 Analisis: {i+1}/{total}")
+
+        elapsed = time.time() - t0
+        pbar.progress(1.0, text=f"✅ Selesai {elapsed:.1f}s")
+        status.empty(); st.rerun()
+
+    if st.session_state.heatmap_hasil:
+        hasil_hm = st.session_state.heatmap_hasil
+        df_hm    = pd.DataFrame(hasil_hm)
+        n_total  = len(df_hm)
+        n_bull   = len(df_hm[df_hm["Sinyal"].isin(["STRONG BUY","BUY","SPEC. BUY"])])
+        n_bear   = len(df_hm[df_hm["Sinyal"].isin(["SELL","STRONG SELL"])])
+
+        # ── Market breadth summary ──
+        breadth_pct = n_bull / n_total * 100 if n_total else 0
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Saham", n_total)
+        m2.metric("🟢 Bullish", n_bull, delta=f"{breadth_pct:.0f}% market")
+        m3.metric("🔴 Bearish/Sell", n_bear)
+        m4.metric("Market Breadth", f"{breadth_pct:.0f}%",
+                  delta="Bullish" if breadth_pct > 50 else "Bearish")
+
+        st.divider()
+
+        # ── Heatmap chart ──
+        fig_hm = build_sector_heatmap(hasil_hm)
+        if fig_hm:
+            st.plotly_chart(fig_hm, use_container_width=True)
+        else:
+            st.info("Tambahkan kolom 'sector' di emiten.csv untuk heatmap per sektor. Menampilkan ringkasan saja.")
+
+        # ── Top sektor bullish ──
+        st.divider()
+        if "Sektor" in df_hm.columns:
+            bull_df = df_hm[df_hm["Sinyal"].isin(["STRONG BUY","BUY","SPEC. BUY"])]
+            top_sektors = bull_df.groupby("Sektor").size().sort_values(ascending=False).head(5)
+
+            col_top, col_list = st.columns([1, 2])
+            with col_top:
+                st.markdown("#### 🔥 Top Sektor Bullish")
+                for sektor, count in top_sektors.items():
+                    pct = count / len(bull_df) * 100 if len(bull_df) else 0
+                    st.markdown(f"**{sektor}** — {count} saham ({pct:.0f}%)")
+
+            with col_list:
+                st.markdown("#### 📋 Saham Bullish per Sektor")
+                sel_sektor = st.selectbox(
+                    "Pilih sektor:", sorted(df_hm["Sektor"].unique()),
+                    key="hm_sektor_sel"
+                )
+                df_sel = df_hm[
+                    (df_hm["Sektor"] == sel_sektor) &
+                    (df_hm["Sinyal"].isin(["STRONG BUY","BUY","SPEC. BUY"]))
+                ].sort_values("Conf.", ascending=False)
+                if not df_sel.empty:
+                    st.dataframe(df_sel[["Ticker","Sinyal","Conf.","Harga"]],
+                                 hide_index=True, use_container_width=True)
+                    # Tombol buka full report
+                    st.markdown("**Klik untuk full report:**")
+                    if "hm_sel_ticker" not in st.session_state:
+                        st.session_state.hm_sel_ticker = None
+                    cols_hm = st.columns(min(6, len(df_sel)))
+                    for j, (_, row) in enumerate(df_sel.iterrows()):
+                        tk = row["Ticker"]
+                        if j < len(cols_hm):
+                            is_active = st.session_state.hm_sel_ticker == tk
+                            if cols_hm[j].button(
+                                f"{'▶ ' if is_active else ''}{tk}",
+                                key=f"hm_btn_{tk}", use_container_width=True,
+                                type="primary" if is_active else "secondary"
+                            ):
+                                st.session_state.hm_sel_ticker = None if is_active else tk
+                                st.rerun()
+                else:
+                    st.info(f"Tidak ada saham bullish di sektor {sel_sektor}")
+
+        # ── Inline full report dari heatmap ──
+        hm_sel = st.session_state.get("hm_sel_ticker")
+        if hm_sel and hm_sel in st.session_state.heatmap_raw:
+            h, sig = st.session_state.heatmap_raw[hm_sel]
+            st.divider()
+            st.markdown(f"## 📋 Full Report: `{hm_sel}` [{get_sektor(hm_sel)}]")
+            render_banner(sig, h["harga"])
+            col_l, col_r = st.columns(2)
+            with col_l:
+                st.markdown("#### 🧠 Konfluensi")
+                for a in sig.alasan:
+                    st.markdown(f"<div style='font-size:0.85rem;padding:2px 0;'>{a}</div>",
+                                unsafe_allow_html=True)
+            with col_r:
+                st.markdown("#### 🎯 Action Plan")
+                for a in sig.aksi:
+                    st.markdown(f"<div style='font-size:0.85rem;padding:2px 0;'>{a}</div>",
+                                unsafe_allow_html=True)
+            st.divider()
+            render_price_ladder(h, sig)
+            st.divider()
+            render_charts(hm_sel, h)
+            if st.button("✖ Tutup", key="hm_close"):
+                st.session_state.hm_sel_ticker = None; st.rerun()
+
+    elif not run_hm:
+        st.info("Klik **Scan Semua Sektor** untuk mulai. Semua saham akan dianalisis dan dikelompokkan per sektor.")
+        if not sektor_map:
+            st.warning(
+                "💡 **Tips:** Tambahkan kolom `sector` di **emiten.csv** untuk heatmap yang lebih akurat.\n\n"
+                "Contoh format:\n```\nticker,sector\nBBCA.JK,Perbankan\nTLKM.JK,Telekomunikasi\n```\n\n"
+                "Tanpa kolom sektor, app akan menebak sektor dari prefix ticker."
+            )
 
 
 # ══════════════════════════════════════════════════════════════
