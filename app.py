@@ -350,6 +350,72 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None) -> Option
     ha_seq     = int((ha["HA_C"] > ha["HA_O"]).iloc[::-1].cumprod().sum())
     ha_no_tail = (float(ha["HA_L"].iloc[-1]) >= float(ha["HA_O"].iloc[-1]) * 0.999) if ha_green else False
 
+    # ── Candle Quality Score (CQS) — pembeda akumulasi vs distribusi ──
+    # CQS = (close - low) / (high - low) → 1.0 = close di high, 0.0 = close di low
+    # Dihitung untuk 3 candle terakhir dan dirata-rata
+    cqs_vals = []
+    for i in [-1, -2, -3]:
+        c_hi = float(high.iloc[i]); c_lo = float(low.iloc[i]); c_cl = float(close.iloc[i])
+        rng = c_hi - c_lo
+        cqs_vals.append((c_cl - c_lo) / rng if rng > 0 else 0.5)
+    cqs = round(float(np.mean(cqs_vals)), 3)          # 0–1
+
+    # ── Distribution trap detection ──
+    # Tanda-tanda: volume spike TAPI close dekat low (institusi jual ke retail)
+    vol_spike       = vol_rel >= 2.0
+    dist_trap       = vol_spike and cqs < 0.4          # volume besar, close rendah
+    accum_confirm   = vol_spike and cqs > 0.6          # volume besar, close tinggi → genuine akumulasi
+
+    # ── Upper shadow ratio — candle berbentuk shooting star / bearish engulf ──
+    o_last = float(s(df["Open"]).iloc[-1])
+    h_last = float(high.iloc[-1]); l_last = float(low.iloc[-1]); c_last = float(close.iloc[-1])
+    body   = abs(c_last - o_last)
+    upper_shadow = h_last - max(c_last, o_last)
+    upper_shadow_ratio = upper_shadow / body if body > 0 else 0.0
+    shooting_star = upper_shadow_ratio > 2.0 and vol_rel > 1.0   # upper shadow > 2× body
+
+    # ── OBV trend (on-balance volume) — apakah volume mendukung harga? ──
+    obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    obv_ema5  = obv.ewm(span=5,  adjust=False).mean()
+    obv_ema20 = obv.ewm(span=20, adjust=False).mean()
+    obv_bull  = float(obv_ema5.iloc[-1]) > float(obv_ema20.iloc[-1])   # OBV trend naik
+
+    # ── Early Bird signals (Ichimoku pre-breakout) ──
+    # Senkou A dan B 26 bar ke depan (future cloud)
+    sa_series = s(ichi.ichimoku_a())
+    sb_series = s(ichi.ichimoku_b())
+    # Kumo twist: titik dimana Senkou A dan B akan bersilangan dalam 26 bar ke depan
+    # Kita deteksi dari perubahan tanda (sa - sb) dalam window terakhir
+    sa_sb_diff = sa_series - sb_series
+    # Cari apakah ada perubahan tanda di 5 bar terakhir (twist baru terjadi)
+    kumo_twist_recent = bool(
+        (sa_sb_diff.iloc[-1] > 0) and (sa_sb_diff.iloc[-6] <= 0)
+    ) if len(sa_sb_diff) >= 6 else False
+    # Kumo menyempit: selisih SA-SB mengecil (tren menuju twist)
+    kumo_width_now  = abs(float(sa_sb_diff.iloc[-1]))
+    kumo_width_5ago = abs(float(sa_sb_diff.iloc[-6])) if len(sa_sb_diff) >= 6 else kumo_width_now
+    kumo_narrowing  = kumo_width_now < kumo_width_5ago * 0.7   # menyempit >30%
+    # Harga mendekati awan dari bawah (dalam 2% dari bawah awan)
+    price_near_cloud = (not di_atas) and (harga >= awan_lo * 0.98)
+    # TK cross baru terjadi (dalam 5 bar terakhir)
+    tk_series    = s(ichi.ichimoku_conversion_line())
+    kj_series    = s(ichi.ichimoku_base_line())
+    tk_kj_diff   = tk_series - kj_series
+    tk_cross_new = bool(
+        (tk_kj_diff.iloc[-1] > 0) and (tk_kj_diff.iloc[-6] <= 0)
+    ) if len(tk_kj_diff) >= 6 else False
+    # Chikou hampir bebas (dalam 3% dari price bar 26 lalu)
+    chikou_near_free = (not chikou_bull) and (harga >= chikou_ref * 0.97)
+
+    # Early bird score (0–5): makin tinggi makin early
+    early_score = sum([
+        kumo_twist_recent,   # awan baru berubah warna
+        kumo_narrowing,      # awan menipis
+        price_near_cloud,    # harga mendekati awan
+        tk_cross_new,        # TK cross baru
+        chikou_near_free,    # chikou hampir bebas
+    ])
+
     return dict(
         ticker=ticker, harga=harga,
         # ichimoku
@@ -375,6 +441,15 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None) -> Option
         in_entry=in_entry, below_cut=below_cut, above_sh=above_sh, near_sh=near_sh,
         # ha
         ha_green=ha_green, ha_seq=ha_seq, ha_no_tail=ha_no_tail,
+        # candle quality & distribution
+        cqs=cqs, dist_trap=dist_trap, accum_confirm=accum_confirm,
+        shooting_star=shooting_star, upper_shadow_ratio=upper_shadow_ratio,
+        obv_bull=obv_bull,
+        # early bird
+        early_score=early_score,
+        kumo_twist_recent=kumo_twist_recent, kumo_narrowing=kumo_narrowing,
+        price_near_cloud=price_near_cloud, tk_cross_new=tk_cross_new,
+        chikou_near_free=chikou_near_free,
     )
 
 
@@ -523,12 +598,31 @@ def build_plan(h: dict) -> TradingSignal:
         alasan.append(f"📊 StochRSI netral (K:{h['srsi_k']:.0f} D:{h['srsi_d']:.0f})")
 
     # ── H. Volume & VWAP ──
-    if h["vol_rel"] >= 1.5:
+    if h["accum_confirm"]:
+        score += WEIGHTS["volume"] * 1.5
+        alasan.append(f"🏦 Volume spike {h['vol_rel']:.1f}× + CQS {h['cqs']:.2f} — GENUINE AKUMULASI smart money!")
+    elif h["dist_trap"]:
+        score -= WEIGHTS["volume"] * 2.0
+        alasan.append(f"🚨 DISTRIBUTION TRAP! Vol {h['vol_rel']:.1f}× tapi CQS {h['cqs']:.2f} — institusi jualan ke retail!")
+    elif h["vol_rel"] >= 1.5:
         score += WEIGHTS["volume"]
-        alasan.append(f"📊 Volume {h['vol_rel']:.1f}×ADV20 — konfirmasi institusional")
+        alasan.append(f"📊 Volume {h['vol_rel']:.1f}×ADV20 — konfirmasi pergerakan")
     elif h["vol_rel"] < 0.5:
         score -= WEIGHTS["volume"] * 0.6
         alasan.append(f"📉 Volume sepi {h['vol_rel']:.1f}×ADV20 — lemah keyakinan")
+    else:
+        alasan.append(f"📊 Volume {h['vol_rel']:.1f}×ADV20 — normal")
+
+    if h["shooting_star"]:
+        score -= 1.0
+        alasan.append(f"⚠️ Shooting star! Upper shadow {h['upper_shadow_ratio']:.1f}× body — potensi reversal")
+
+    if h["obv_bull"]:
+        score += WEIGHTS["vwap"] * 0.8
+        alasan.append("✅ OBV trend naik — volume mendukung harga")
+    else:
+        score -= WEIGHTS["vwap"] * 0.3
+        alasan.append("⚠️ OBV divergen — volume tidak mendukung kenaikan")
 
     if h["price_above_vwap"]:
         score += WEIGHTS["vwap"]
@@ -581,9 +675,30 @@ def build_plan(h: dict) -> TradingSignal:
     elif atr_pct < 3.0:  atr_label = f"Volatilitas Sedang ({atr_pct:.1f}% ATR) → sizing 50-75%"
     else:                atr_label = f"Volatilitas Tinggi ({atr_pct:.1f}% ATR) → hati-hati, sizing 25-40%"
 
-    # ── Action plan ──
+    # ── Action plan — distribution trap override ──
     rr_val = (lvl["target_1"] - p) / max(p - lvl["cutloss"], 1)
-    if "BUY" in sinyal:
+
+    # Hard override: kalau distribution trap terdeteksi → paksa WAIT/SELL
+    if h["dist_trap"] and "BUY" in sinyal:
+        sinyal = "WAIT"
+        css    = "WAIT"
+        sizing = 0
+        aksi.append("🚨 DISTRIBUTION TRAP terdeteksi — sinyal BUY DIBATALKAN!")
+        aksi.append(f"🔍 Volume {h['vol_rel']:.1f}×ADV tapi CQS {h['cqs']:.2f} — close terlalu dekat LOW")
+        aksi.append("⏳ Tunggu 1–3 hari konfirmasi: apakah harga lanjut naik atau turun")
+        aksi.append(f"❗ Aman entry hanya jika CQS > 0.6 pada volume tinggi berikutnya")
+    elif h["shooting_star"] and "BUY" in sinyal:
+        aksi.append("⚠️ Ada pola shooting star — pertimbangkan sizing lebih kecil atau tunggu konfirmasi")
+        aksi.append(f"🛑 CUTLOSS diperketat: jika close < {lvl['cutloss']:,.0f}")
+        if h["in_entry"]:
+            aksi.append(f"🟡 Entry dengan sizing 50% saja, sisanya tunggu hari berikutnya")
+        else:
+            aksi.append(f"⏳ TUNGGU harga masuk zona entry: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
+        aksi.append(f"🎯 TARGET 1: {lvl['target_1']:,.0f}   TARGET 2: {lvl['target_2']:,.0f}")
+        aksi.append(f"📐 R/R saat ini ≈ 1 : {rr_val:.1f}")
+    elif "BUY" in sinyal:
+        if h["accum_confirm"]:
+            aksi.append("🏦 Akumulasi institusional terkonfirmasi — sinyal lebih kuat dari biasa!")
         if h["in_entry"]:
             aksi.append(f"🟢 ENTRY sekarang — harga {p:,.0f} ada di zona sweet spot")
         else:
@@ -595,9 +710,10 @@ def build_plan(h: dict) -> TradingSignal:
         if sizing:
             aksi.append(f"🎲 Sizing saran: {sizing}% dari alokasi posisi")
     elif "WAIT" in sinyal:
-        aksi.append(f"⏳ WAIT — konfluensi belum cukup kuat")
-        aksi.append(f"👁️ Set alert di zona entry: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
-        aksi.append("👁️ Tunggu MACD cross up + HA hijau sebagai konfirmasi tambahan")
+        if not h["dist_trap"]:
+            aksi.append(f"⏳ WAIT — konfluensi belum cukup kuat")
+            aksi.append(f"👁️ Set alert di zona entry: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
+            aksi.append("👁️ Tunggu MACD cross up + HA hijau + CQS > 0.6 sebagai konfirmasi")
     else:
         aksi.append("🔴 JANGAN masuk posisi baru — sinyal bearish dominan")
         aksi.append("📤 Jika pegang: pertimbangkan REDUCE atau EXIT bertahap")
@@ -726,7 +842,7 @@ with st.sidebar:
                 unsafe_allow_html=True)
     st.divider()
 
-    mode = st.radio("Mode", ["🔍 Analisis + Plan", "🚀 Screener Massal"], label_visibility="collapsed")
+    mode = st.radio("Mode", ["🔍 Analisis + Plan", "🚀 Screener Massal", "🐦 Early Bird"], label_visibility="collapsed")
     st.divider()
 
     days = st.slider("Lookback Fibonacci (hari)", 30, 365, 120, 10)
@@ -740,9 +856,9 @@ with st.sidebar:
     st.markdown(f"""
     <div style="font-size:0.72rem;color:#8b949e;line-height:1.8;">
       {'🟢 scipy' if HAS_SCIPY else '🟡 fallback pivot'}<br>
-      Indikator: Ichimoku · EMA · MACD · ADX<br>
-      StochRSI · ATR · VWAP · Heikin Ashi<br>
-      Fibonacci · Volume Profile
+      Ichimoku · EMA · MACD · ADX · StochRSI<br>
+      ATR · VWAP · OBV · CQS · Heikin Ashi<br>
+      Fibonacci · Early Bird · Dist. Trap
     </div>
     """, unsafe_allow_html=True)
 
@@ -1043,7 +1159,231 @@ elif "Screener" in mode:
                 m3.metric("HA Status", f"{'🟢' if h['ha_green'] else '🔴'} {h['ha_seq']} candle")
                 m4.metric("Price vs VWAP", "✅ Di atas" if h["price_above_vwap"] else "⚠️ Di bawah")
 
+                st.divider()
+                c1, c2, c3, c4 = st.columns(4)
+                cqs_label = "🏦 Akumulasi" if h["accum_confirm"] else ("🚨 Distribusi!" if h["dist_trap"] else "📊 Normal")
+                c1.metric("CQS (3 candle)", f"{h['cqs']:.2f}", delta=cqs_label)
+                c2.metric("OBV Trend", "✅ Naik" if h["obv_bull"] else "⚠️ Turun")
+                c3.metric("Shooting Star", "⚠️ YA" if h["shooting_star"] else "✅ Tidak")
+                c4.metric("Early Bird Score", f"{h['early_score']}/5")
+
             # ── Tutup report ──
             if st.button("✖ Tutup Report", key="close_report"):
                 st.session_state.selected_ticker = None
                 st.rerun()
+
+# ══════════════════════════════════════════════════════════════
+# MODE 3: EARLY BIRD — deteksi dini sebelum breakout
+# ══════════════════════════════════════════════════════════════
+elif "Early Bird" in mode:
+    st.markdown("## 🐦 Early Bird Screener")
+    st.markdown(
+        "<span style='color:#8b949e;font-size:0.85rem;'>"
+        "Deteksi saham yang **belum** breakout tapi sinyal Ichimoku mulai terbentuk "
+        "— masuk sebelum semua orang sadar"
+        "</span>", unsafe_allow_html=True
+    )
+
+    # Penjelasan sinyal
+    with st.expander("📖 Apa yang dideteksi?", expanded=False):
+        col_e1, col_e2 = st.columns(2)
+        with col_e1:
+            st.markdown("""
+**5 sinyal early bird (tiap = 1 poin):**
+- 🌀 **Kumo twist baru** — Senkou A baru cross Senkou B, awan ganti warna
+- 📉 **Kumo menyempit** — ketebalan awan turun >30% dalam 5 bar
+- 🔜 **Harga dekat awan** — dalam 2% dari bawah awan
+- ⚡ **TK cross baru** — Tenkan baru motong Kijun dalam 5 bar
+- 👁️ **Chikou hampir bebas** — dalam 3% dari price bar 26 lalu
+""")
+        with col_e2:
+            st.markdown("""
+**Filter tambahan:**
+- Harga belum di atas awan (masih pre-breakout)
+- Tidak sedang distribution trap (CQS > 0.35)
+- Volume tidak sedang colaps (<0.3×ADV)
+- Minimum early score: 2 dari 5 sinyal
+
+**Risk:** Ini sinyal *awal* — belum konfirmasi penuh.
+Sizing lebih kecil, cutloss lebih ketat.
+""")
+
+    # Session state early bird
+    if "eb_hasil"  not in st.session_state: st.session_state.eb_hasil  = []
+    if "eb_raw"    not in st.session_state: st.session_state.eb_raw    = {}
+    if "eb_sel"    not in st.session_state: st.session_state.eb_sel    = None
+
+    min_eb_score = st.slider("Min. Early Bird Score (dari 5)", 1, 5, 2)
+    col_b1, col_b2 = st.columns([2, 1])
+    with col_b1:
+        run_eb = st.button("🐦 Mulai Early Bird Scan", type="primary", use_container_width=True)
+    with col_b2:
+        if st.button("🔄 Reset", key="eb_reset", use_container_width=True):
+            st.session_state.eb_hasil = []; st.session_state.eb_raw = {}
+            st.session_state.eb_sel = None; st.rerun()
+
+    if run_eb:
+        st.session_state.eb_hasil = []; st.session_state.eb_raw = {}; st.session_state.eb_sel = None
+        errors_eb: list[str] = []
+
+        pbar   = st.progress(0, text="Download paralel…")
+        status = st.empty(); holder = st.empty()
+        total  = len(daftar_saham); t0 = time.time()
+
+        # Fase 1: download paralel
+        status.markdown("⚡ Download paralel…")
+        data_map_eb: dict[str, pd.DataFrame] = {}
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            fut = {ex.submit(download_one, t): t for t in daftar_saham}
+            for f in concurrent.futures.as_completed(fut):
+                t = fut[f]
+                try:    data_map_eb[t] = f.result()
+                except: data_map_eb[t] = pd.DataFrame()
+                done += 1
+                pbar.progress(done / total / 2, text=f"⚡ Download: {done}/{total}")
+
+        # Fase 2: scan early bird
+        status.markdown("🐦 Scanning early signals…")
+        for i, ticker in enumerate(daftar_saham):
+            df_t = data_map_eb.get(ticker, pd.DataFrame())
+            if df_t is None or df_t.empty: continue
+            try:
+                h = analyse(ticker, days, df=df_t)
+                if not h: continue
+
+                # Filter: belum breakout + cukup early signals
+                if h["di_atas"]: continue              # sudah di atas awan → bukan early bird
+                if h["early_score"] < min_eb_score: continue
+                if h["dist_trap"]: continue            # distribusi → skip
+                if h["vol_rel"] < 0.3: continue        # volume mati → skip
+
+                sig = build_plan(h)
+                st.session_state.eb_raw[ticker] = (h, sig)
+
+                # Early bird label per sinyal
+                eb_signals = []
+                if h["kumo_twist_recent"]: eb_signals.append("🌀Twist")
+                if h["kumo_narrowing"]:    eb_signals.append("📉Sempit")
+                if h["price_near_cloud"]:  eb_signals.append("🔜Dekat")
+                if h["tk_cross_new"]:      eb_signals.append("⚡TKcross")
+                if h["chikou_near_free"]:  eb_signals.append("👁️Chikou")
+
+                st.session_state.eb_hasil.append({
+                    "Ticker":      ticker,
+                    "EB Score":    f"{h['early_score']}/5",
+                    "Sinyal":      " ".join(eb_signals),
+                    "Harga":       int(round(h["harga"])),
+                    "Jarak Awan":  f"{((h['awan_lo'] - h['harga']) / h['harga'] * 100):+.1f}%",
+                    "Entry Plan":  f"{int(round(h['lvl']['entry_bawah']))}–{int(round(h['lvl']['entry_atas']))}",
+                    "CQS":         f"{h['cqs']:.2f}",
+                    "Vol":         f"{h['vol_rel']:.1f}×",
+                    "MACD":        "🚀" if h["macd_cross_up"] else ("✅" if h["macd_bull"] else "❌"),
+                    "RSI":         f"{h['rsi']:.0f}",
+                })
+
+                df_tmp = pd.DataFrame(st.session_state.eb_hasil).sort_values("EB Score", ascending=False)
+                holder.dataframe(df_tmp, hide_index=True, use_container_width=True)
+
+            except Exception as e:
+                errors_eb.append(f"{ticker}: {e}")
+
+            pbar.progress(0.5 + (i+1)/total/2, text=f"🐦 Scan: {i+1}/{total}")
+
+        elapsed = time.time() - t0
+        pbar.progress(1.0, text=f"✅ Selesai {elapsed:.1f}s")
+        status.empty(); holder.empty()
+
+        if errors_eb:
+            with st.expander(f"⚠️ {len(errors_eb)} error"): 
+                for e in errors_eb: st.text(e)
+        st.rerun()
+
+    # ── Render hasil early bird ──
+    if st.session_state.eb_hasil:
+        df_eb = pd.DataFrame(st.session_state.eb_hasil).sort_values("EB Score", ascending=False).reset_index(drop=True)
+        st.success(f"🐦 **{len(df_eb)} calon early bird** ditemukan — belum breakout, sinyal mulai terbentuk")
+
+        # Warning box
+        st.warning(
+            "⚠️ **Early bird = sinyal awal, bukan konfirmasi penuh.** "
+            "Gunakan sizing 25–50% dari normal. Cutloss lebih ketat. "
+            "Pantau tiap hari sampai harga konfirmasi tembus awan."
+        )
+
+        st.dataframe(df_eb, hide_index=True, use_container_width=True)
+        csv_eb = df_eb.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download CSV Early Bird", csv_eb, "early_bird.csv", "text/csv")
+
+        st.divider()
+        st.markdown("#### 🔍 Klik untuk full report:")
+
+        tickers_eb = df_eb["Ticker"].tolist()
+        COLS = 6
+        for row in [tickers_eb[i:i+COLS] for i in range(0, len(tickers_eb), COLS)]:
+            cols = st.columns(COLS)
+            for j, tk in enumerate(row):
+                if tk in st.session_state.eb_raw:
+                    is_active = st.session_state.eb_sel == tk
+                    if cols[j].button(
+                        f"{'▶ ' if is_active else ''}{tk}",
+                        key=f"eb_btn_{tk}",
+                        use_container_width=True,
+                        type="primary" if is_active else "secondary"
+                    ):
+                        st.session_state.eb_sel = None if is_active else tk
+                        st.rerun()
+
+        # Inline full report early bird
+        eb_sel = st.session_state.eb_sel
+        if eb_sel and eb_sel in st.session_state.eb_raw:
+            h, sig = st.session_state.eb_raw[eb_sel]
+            st.divider()
+            st.markdown(f"## 🐦 Early Bird Report: `{eb_sel}`")
+
+            # Early bird status bar
+            eb_cols = st.columns(5)
+            eb_items = [
+                ("🌀 Kumo Twist", h["kumo_twist_recent"]),
+                ("📉 Kumo Sempit", h["kumo_narrowing"]),
+                ("🔜 Dekat Awan", h["price_near_cloud"]),
+                ("⚡ TK Cross", h["tk_cross_new"]),
+                ("👁️ Chikou", h["chikou_near_free"]),
+            ]
+            for col, (label, val) in zip(eb_cols, eb_items):
+                col.metric(label, "✅ YA" if val else "❌ Belum")
+
+            st.markdown(f"""
+            <div style="background:#0d1a2a;border:1px solid #1565c0;border-radius:10px;
+                        padding:1rem 1.4rem;margin:1rem 0;font-size:0.88rem;">
+              <strong style="color:#42a5f5;">📋 Trading Plan Early Bird</strong><br><br>
+              🎯 <strong>Entry ideal:</strong> {h['lvl']['entry_bawah']:,.0f} – {h['lvl']['entry_atas']:,.0f}
+                 (atau saat harga tembus awan {h['awan_lo']:,.0f})<br>
+              🛑 <strong>Cutloss:</strong> {h['lvl']['cutloss']:,.0f}
+                 (lebih ketat: bisa pakai {h['lvl']['entry_bawah'] * 0.97:,.0f})<br>
+              🎯 <strong>Target 1:</strong> {h['lvl']['target_1']:,.0f}
+                 &nbsp;|&nbsp; <strong>Target 2:</strong> {h['lvl']['target_2']:,.0f}<br>
+              💰 <strong>Sizing:</strong> 25–50% dari normal (sinyal belum konfirmasi penuh)<br>
+              👁️ <strong>Trigger masuk:</strong> tunggu harga close di atas awan Ichimoku
+                 ({h['awan_lo']:,.0f}) dengan volume >1.5×ADV dan CQS >0.6
+            </div>
+            """, unsafe_allow_html=True)
+
+            render_banner(sig, h["harga"])
+
+            col_l, col_r = st.columns(2)
+            with col_l:
+                st.markdown("#### 🧠 Konfluensi")
+                for a in sig.alasan:
+                    st.markdown(f"<div style='font-size:0.85rem;padding:2px 0;'>{a}</div>", unsafe_allow_html=True)
+            with col_r:
+                st.markdown("#### 🎯 Action Plan")
+                for a in sig.aksi:
+                    st.markdown(f"<div style='font-size:0.85rem;padding:2px 0;'>{a}</div>", unsafe_allow_html=True)
+
+            st.divider()
+            st.markdown("#### 📏 Price Ladder")
+            render_price_ladder(h, sig)
+
+            if st.button("✖ Tutup", key="eb_close"):
+                st.session_state.eb_sel = None; st.rerun()
