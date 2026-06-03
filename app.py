@@ -1213,38 +1213,42 @@ def build_volume_profile(df: pd.DataFrame, h: dict, bins: int = 40) -> go.Figure
     return fig, poc, vah, val
 
 
-def render_charts(ticker: str, h: dict):
-    """Render chart panel lengkap — dipanggil dari mode Analisis dan Screener inline."""
+def render_charts(ticker: str, h: dict, ctx: str = "default"):
+    """
+    Render chart panel lengkap.
+    ctx: string unik per call site ('analisis', 'screener', 'eb', 'heatmap')
+    — dipakai sebagai bagian key widget supaya stable across reruns.
+    """
     df = download_one(ticker)
     if df is None or df.empty:
         st.warning("Data tidak tersedia untuk chart."); return
 
-    # ── State keys unik per ticker ──
-    key_ct   = f"_ct_{ticker}"
-    key_bars = f"_bars_{ticker}"
+    # Key stabil: kombinasi ctx + ticker, tidak bergantung posisi di script
+    key_ct   = f"_ct_{ctx}_{ticker}"
+    key_bars = f"_bars_{ctx}_{ticker}"
     if key_ct   not in st.session_state: st.session_state[key_ct]   = "Candle"
     if key_bars not in st.session_state: st.session_state[key_bars] = 120
 
     col_ct, col_bars = st.columns([2, 3])
     with col_ct:
-        # Pakai index bukan key — tidak trigger re-render ke root
         ct_idx = st.radio(
             "Tipe candle:", ["Candle", "Heikin Ashi"],
             horizontal=True,
             index=["Candle", "Heikin Ashi"].index(st.session_state[key_ct]),
+            key=key_ct,   # key stabil → Streamlit ingat value-nya
         )
-        st.session_state[key_ct] = ct_idx
+        # Tidak perlu assign manual — Streamlit sudah simpan ke session_state[key_ct]
 
     with col_bars:
         bar_opts = [60, 90, 120, 180, 252, 365, 500, 730]
         cur_bars = st.session_state[key_bars]
         if cur_bars not in bar_opts: cur_bars = 120
-        bars_val = st.select_slider(
+        st.select_slider(
             "Tampilkan berapa bar:",
             options=bar_opts,
             value=cur_bars,
+            key=key_bars,  # key stabil
         )
-        st.session_state[key_bars] = bars_val
 
     candle_type = st.session_state[key_ct]
     chart_bars  = st.session_state[key_bars]
@@ -1615,7 +1619,7 @@ if "Analisis" in mode:
             ])
 
             with tab0:
-                render_charts(ticker, h)
+                render_charts(ticker, h, ctx="analisis")
 
             with tab1:
                 d = {
@@ -1830,7 +1834,7 @@ elif "Heatmap" in mode:
             st.divider()
             render_price_ladder(h, sig)
             st.divider()
-            render_charts(hm_sel, h)
+            render_charts(hm_sel, h, ctx="heatmap")
             if st.button("✖ Tutup", key="hm_close"):
                 st.session_state.hm_sel_ticker = None; st.rerun()
 
@@ -1866,7 +1870,7 @@ elif "Screener" in mode:
     with col_btn:
         run_screen = st.button("▶ Mulai Screening", type="primary", use_container_width=True)
     with col_rst:
-        if st.button("🔄 Reset", use_container_width=True):
+        if st.button("🔄 Reset", key="screen_reset", use_container_width=True):
             st.session_state.screener_hasil  = []
             st.session_state.screener_raw    = {}
             st.session_state.selected_ticker = None
@@ -2038,7 +2042,7 @@ elif "Screener" in mode:
             tab0, tab1, tab2, tab3 = st.tabs(["📈 Chart", "☁️ Ichimoku + EMA", "📐 Momentum", "📊 Volume + HA"])
 
             with tab0:
-                render_charts(sel, h)
+                render_charts(sel, h, ctx="screener")
 
             with tab1:
                 d = {
@@ -2300,7 +2304,7 @@ Sizing lebih kecil, cutloss lebih ketat.
 
             st.divider()
             st.markdown("#### 📈 Chart")
-            render_charts(eb_sel, h)
+            render_charts(eb_sel, h, ctx="earlybird")
 
             st.divider()
             st.markdown("#### 📏 Price Ladder")
