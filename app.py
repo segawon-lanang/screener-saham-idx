@@ -221,6 +221,94 @@ def rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
 
 
 # ══════════════════════════════════════════════════════════════
+# LIQUIDITY & HEALTH FILTER
+# ══════════════════════════════════════════════════════════════
+@dataclass
+class HealthCheck:
+    lolos: bool
+    alasan: str          # kenapa diloloskan / ditolak
+    flags: list[str]     # daftar masalah yang ditemukan
+
+
+def health_check(df: pd.DataFrame, ticker: str,
+                 min_price: float      = 50,
+                 min_adv_juta: float   = 500,     # Rp juta/hari
+                 min_active_days: float = 0.70,   # % hari aktif (ada transaksi)
+                 max_flat_streak: int   = 10,      # max hari berturut close = open
+                 ) -> HealthCheck:
+    """
+    Deteksi saham tidur / tidak likuid / zombie / FCA-like.
+    Return HealthCheck — caller putuskan mau skip atau warning.
+    """
+    flags: list[str] = []
+    close  = s(df["Close"])
+    high_s = s(df["High"])
+    low_s  = s(df["Low"])
+    vol_s  = s(df["Volume"])
+    open_s = s(df["Open"])
+
+    last_60  = df.tail(60)
+    close_60 = s(last_60["Close"])
+    vol_60   = s(last_60["Volume"])
+    high_60  = s(last_60["High"])
+    low_60   = s(last_60["Low"])
+
+    # ── 1. Harga terlalu murah (saham gocap / penny) ──
+    last_price = float(close.iloc[-1])
+    if last_price < min_price:
+        flags.append(f"💀 Penny stock ({last_price:.0f} < {min_price:.0f}) — rentan manipulasi")
+
+    # ── 2. Nilai transaksi harian terlalu kecil ──
+    # ADV value = rata-rata (close × volume) 20 hari terakhir
+    adv_value_juta = float((close_60 * vol_60).tail(20).mean()) / 1_000_000
+    if adv_value_juta < min_adv_juta:
+        flags.append(f"😴 Likuiditas rendah (ADV Rp{adv_value_juta:.0f}jt < Rp{min_adv_juta:.0f}jt)")
+
+    # ── 3. Frekuensi hari aktif — saham tidur ──
+    # Hari aktif = volume > 0 DAN high != low (ada pergerakan)
+    active_mask  = (vol_60 > 0) & (high_60 != low_60)
+    active_ratio = float(active_mask.mean())
+    if active_ratio < min_active_days:
+        flags.append(f"😴 Saham tidur ({active_ratio*100:.0f}% hari aktif, min {min_active_days*100:.0f}%)")
+
+    # ── 4. Flat streak — banyak hari close == open (price frozen) ──
+    flat_days = int((abs(close_60 - s(last_60["Open"])) < 1).sum())
+    if flat_days > max_flat_streak:
+        flags.append(f"🧟 Price frozen ({flat_days} hari close≈open dalam 60 hari)")
+
+    # ── 5. Volume anomali ekstrem (pump & dump pattern) ──
+    # Spike volume 10× ADV diikuti volume mati
+    vol_20  = float(vol_60.tail(20).mean())
+    vol_max = float(vol_60.max())
+    vol_now = float(vol_60.tail(5).mean())
+    if vol_max > vol_20 * 10 and vol_now < vol_20 * 0.3:
+        flags.append("⚠️ Pump & dump pattern — volume spike lalu mati")
+
+    # ── 6. Harga sudah turun > 80% dari high 1 tahun (zombie) ──
+    high_1y = float(s(df["High"]).tail(252).max())
+    if high_1y > 0 and last_price < high_1y * 0.20:
+        flags.append(f"🧟 Zombie — harga {last_price:.0f} sudah turun {(1-last_price/high_1y)*100:.0f}% dari high 1 tahun ({high_1y:.0f})")
+
+    # ── 7. Volatilitas terlalu rendah (saham dikunci / tidak bergerak) ──
+    # ATR% rata-rata < 0.3% = nyaris tidak bergerak
+    atr_pct_avg = float(
+        AverageTrueRange(high_60, low_60, close_60, window=14)
+        .average_true_range().tail(10).mean()
+    ) / last_price * 100 if last_price > 0 else 0
+    if atr_pct_avg < 0.3:
+        flags.append(f"😴 Volatilitas sangat rendah (ATR {atr_pct_avg:.2f}%) — saham tidak bergerak")
+
+    # ── 8. Bid-ask spread proxy: banyak candle doji (high-low sangat kecil) ──
+    doji_ratio = float(((high_60 - low_60) < last_price * 0.003).mean())
+    if doji_ratio > 0.5:
+        flags.append(f"😴 {doji_ratio*100:.0f}% candle doji — spread sangat sempit / tidak ada minat")
+
+    lolos  = len(flags) == 0
+    alasan = "✅ Sehat" if lolos else f"❌ {len(flags)} masalah ditemukan"
+    return HealthCheck(lolos=lolos, alasan=alasan, flags=flags)
+
+
+# ══════════════════════════════════════════════════════════════
 # DOWNLOAD  (parallel-capable, cached)
 # ══════════════════════════════════════════════════════════════
 @st.cache_data(ttl=900, show_spinner=False)
@@ -1209,6 +1297,11 @@ with st.sidebar:
     require_ha  = st.toggle("Filter HA Hijau", value=True)
     min_vol_rel = st.slider("Min. Volume Relatif ×ADV20", 0.0, 3.0, 0.5, 0.1)
     min_conf    = st.slider("Min. Confidence (%)", 0, 100, 50, 5)
+    st.divider()
+    st.markdown("**🏥 Liquidity Filter**")
+    use_health    = st.toggle("Aktifkan filter likuiditas", value=True)
+    min_price     = st.number_input("Min. harga (Rp)", value=50, step=10)
+    min_adv_juta  = st.number_input("Min. ADV value (Rp juta/hari)", value=500, step=100)
     workers     = st.slider("Parallel workers (screener)", 2, 16, 8, 2,
                              help="Thread paralel untuk download. Lebih tinggi = lebih cepat.")
     st.divider()
@@ -1238,6 +1331,16 @@ if "Analisis" in mode:
         if not h:
             st.error("Data tidak cukup atau ticker tidak valid.")
         else:
+            # Health check
+            if use_health:
+                df_hc = download_one(ticker)
+                hc = health_check(df_hc, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
+                if not hc.lolos:
+                    st.warning(f"⚠️ **Health Check:** {hc.alasan}")
+                    for f in hc.flags:
+                        st.markdown(f"- {f}")
+                    st.info("Analisis tetap ditampilkan — gunakan dengan ekstra hati-hati.")
+
             sig = build_plan(h)
 
             render_banner(sig, h["harga"])
@@ -1361,6 +1464,10 @@ elif "Screener" in mode:
             try:
                 h = analyse(ticker, days, df=df_t)
                 if not h: continue
+                # Health check filter
+                if use_health:
+                    hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
+                    if not hc.lolos: continue
                 if require_ha and not h["ha_green"]: continue
                 if not (h["di_atas"] and h["tk_kj"]): continue
                 if h["vol_rel"] < min_vol_rel: continue
@@ -1613,6 +1720,10 @@ Sizing lebih kecil, cutloss lebih ketat.
             try:
                 h = analyse(ticker, days, df=df_t)
                 if not h: continue
+                # Health check
+                if use_health:
+                    hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
+                    if not hc.lolos: continue
 
                 # Filter: belum breakout + cukup early signals
                 if h["di_atas"]: continue              # sudah di atas awan → bukan early bird
