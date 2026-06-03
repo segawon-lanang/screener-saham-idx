@@ -1219,29 +1219,36 @@ def render_charts(ticker: str, h: dict):
     if df is None or df.empty:
         st.warning("Data tidak tersedia untuk chart."); return
 
-    # ── Simpan pilihan ke session_state agar tidak reset saat interaksi ──
-    key_ct   = f"ctype_{ticker}"
-    key_bars = f"cbars_{ticker}"
+    # ── State keys unik per ticker ──
+    key_ct   = f"_ct_{ticker}"
+    key_bars = f"_bars_{ticker}"
     if key_ct   not in st.session_state: st.session_state[key_ct]   = "Candle"
     if key_bars not in st.session_state: st.session_state[key_bars] = 120
 
     col_ct, col_bars = st.columns([2, 3])
     with col_ct:
-        candle_type = st.radio(
+        # Pakai index bukan key — tidak trigger re-render ke root
+        ct_idx = st.radio(
             "Tipe candle:", ["Candle", "Heikin Ashi"],
             horizontal=True,
             index=["Candle", "Heikin Ashi"].index(st.session_state[key_ct]),
-            key=key_ct,
         )
-    with col_bars:
-        chart_bars = st.select_slider(
-            "Tampilkan berapa bar:",
-            options=[60, 90, 120, 180, 252, 365, 500, 730],
-            value=st.session_state[key_bars],
-            key=key_bars,
-        )
+        st.session_state[key_ct] = ct_idx
 
-    df_chart = df.tail(chart_bars)
+    with col_bars:
+        bar_opts = [60, 90, 120, 180, 252, 365, 500, 730]
+        cur_bars = st.session_state[key_bars]
+        if cur_bars not in bar_opts: cur_bars = 120
+        bars_val = st.select_slider(
+            "Tampilkan berapa bar:",
+            options=bar_opts,
+            value=cur_bars,
+        )
+        st.session_state[key_bars] = bars_val
+
+    candle_type = st.session_state[key_ct]
+    chart_bars  = st.session_state[key_bars]
+    df_chart    = df.tail(chart_bars)
 
     col_chart, col_vp = st.columns([3, 1])
 
