@@ -1045,16 +1045,20 @@ def build_volume_profile(df: pd.DataFrame, h: dict, bins: int = 40) -> go.Figure
     va_lo_idx, va_hi_idx = poc_idx, poc_idx
     accumulated = vol_per_bin[poc_idx]
     while accumulated < target_vol:
-        expand_lo = va_lo_idx > 0
-        expand_hi = va_hi_idx < bins - 1
-        if not expand_lo and not expand_hi:
+        can_lo = va_lo_idx > 0
+        can_hi = va_hi_idx < bins - 1
+        if not can_lo and not can_hi:
             break
-        add_lo = vol_per_bin[va_lo_idx - 1] if expand_lo else 0
-        add_hi = vol_per_bin[va_hi_idx + 1] if expand_hi else 0
-        if add_hi >= add_lo:
-            va_hi_idx += 1; accumulated += vol_per_bin[va_hi_idx]
+        add_lo = vol_per_bin[va_lo_idx - 1] if can_lo else -1
+        add_hi = vol_per_bin[va_hi_idx + 1] if can_hi else -1
+        if add_hi >= add_lo and can_hi:
+            va_hi_idx += 1
+            accumulated += vol_per_bin[va_hi_idx]
+        elif can_lo:
+            va_lo_idx -= 1
+            accumulated += vol_per_bin[va_lo_idx]
         else:
-            va_lo_idx -= 1; accumulated += vol_per_bin[va_lo_idx]
+            break
 
     vah = bin_centers[va_hi_idx]
     val = bin_centers[va_lo_idx]
