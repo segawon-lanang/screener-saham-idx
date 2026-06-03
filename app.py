@@ -1219,18 +1219,28 @@ def render_charts(ticker: str, h: dict):
     if df is None or df.empty:
         st.warning("Data tidak tersedia untuk chart."); return
 
-    # Toggle candle type
-    candle_type = st.radio(
-        "Tipe candle:", ["Candle", "Heikin Ashi"],
-        horizontal=True, key=f"ctype_{ticker}"
-    )
+    # ── Simpan pilihan ke session_state agar tidak reset saat interaksi ──
+    key_ct   = f"ctype_{ticker}"
+    key_bars = f"cbars_{ticker}"
+    if key_ct   not in st.session_state: st.session_state[key_ct]   = "Candle"
+    if key_bars not in st.session_state: st.session_state[key_bars] = 120
 
-    # Lookback window chart
-    chart_bars = st.select_slider(
-        "Tampilkan berapa bar:",
-        options=[60, 90, 120, 180, 252, 365, 500, 730],
-        value=120, key=f"cbars_{ticker}"
-    )
+    col_ct, col_bars = st.columns([2, 3])
+    with col_ct:
+        candle_type = st.radio(
+            "Tipe candle:", ["Candle", "Heikin Ashi"],
+            horizontal=True,
+            index=["Candle", "Heikin Ashi"].index(st.session_state[key_ct]),
+            key=key_ct,
+        )
+    with col_bars:
+        chart_bars = st.select_slider(
+            "Tampilkan berapa bar:",
+            options=[60, 90, 120, 180, 252, 365, 500, 730],
+            value=st.session_state[key_bars],
+            key=key_bars,
+        )
+
     df_chart = df.tail(chart_bars)
 
     col_chart, col_vp = st.columns([3, 1])
