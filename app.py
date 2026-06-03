@@ -816,6 +816,362 @@ def score_badge_html(sinyal: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
+# CHART ENGINE  (Plotly — candlestick + Ichimoku + Fibo + Volume)
+# ══════════════════════════════════════════════════════════════
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+CHART_THEME = dict(
+    bg       = "#0b0e17",
+    bg2      = "#161b22",
+    grid     = "#21262d",
+    text     = "#c9d1d9",
+    green    = "#00e676",
+    red      = "#f44336",
+    tenkan   = "#e91e63",
+    kijun    = "#2196f3",
+    sa       = "rgba(0,230,118,0.15)",
+    sb       = "rgba(244,67,54,0.15)",
+    ema20    = "#ff9800",
+    ema50    = "#9c27b0",
+    fib_col  = "rgba(255,214,0,0.55)",
+    vwap     = "#00bcd4",
+)
+
+def build_chart(ticker: str, h: dict, df: pd.DataFrame, candle_type: str = "Candle") -> go.Figure:
+    """
+    Buat chart lengkap:
+      Panel atas (70%): candlestick/HA + Ichimoku cloud + EMA20/50 + Fibonacci levels + VWAP
+      Panel bawah (30%): volume bar + ADV20 line + volume profile background
+    """
+    CT = CHART_THEME
+    close  = s(df["Close"])
+    high_s = s(df["High"])
+    low_s  = s(df["Low"])
+    open_s = s(df["Open"])
+    vol_s  = s(df["Volume"])
+    dates  = df.index
+
+    # Ichimoku series (full history)
+    ichi   = IchimokuIndicator(high=high_s, low=low_s)
+    tk_s   = s(ichi.ichimoku_conversion_line())
+    kj_s   = s(ichi.ichimoku_base_line())
+    sa_s   = s(ichi.ichimoku_a())
+    sb_s   = s(ichi.ichimoku_b())
+
+    # EMA
+    ema20_s = EMAIndicator(close, window=20).ema_indicator()
+    ema50_s = EMAIndicator(close, window=50).ema_indicator()
+
+    # VWAP 20d rolling
+    vwap_s = (close * vol_s).rolling(20).sum() / vol_s.rolling(20).sum()
+
+    # Heikin Ashi
+    ha_df  = heikin_ashi(df)
+
+    # ADV20
+    adv20_s = vol_s.rolling(20).mean()
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        row_heights=[0.72, 0.28],
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+    )
+
+    # ── Kumo (cloud) ──
+    # Isi cloud hijau (SA > SB)
+    fig.add_trace(go.Scatter(
+        x=list(dates) + list(dates[::-1]),
+        y=list(sa_s) + list(sb_s[::-1]),
+        fill="toself",
+        fillcolor="rgba(0,200,100,0.12)",
+        line=dict(width=0),
+        name="Kumo Bullish", showlegend=False, hoverinfo="skip",
+    ), row=1, col=1)
+    # Isi cloud merah (SB > SA)
+    fig.add_trace(go.Scatter(
+        x=list(dates) + list(dates[::-1]),
+        y=list(sb_s) + list(sa_s[::-1]),
+        fill="toself",
+        fillcolor="rgba(244,67,54,0.10)",
+        line=dict(width=0),
+        name="Kumo Bearish", showlegend=False, hoverinfo="skip",
+    ), row=1, col=1)
+    # Senkou A & B borders
+    fig.add_trace(go.Scatter(x=dates, y=sa_s, line=dict(color="rgba(0,200,100,0.5)", width=1),
+                             name="Senkou A", showlegend=True), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=sb_s, line=dict(color="rgba(244,67,54,0.5)", width=1),
+                             name="Senkou B", showlegend=True), row=1, col=1)
+
+    # ── Candlestick atau Heikin Ashi ──
+    if candle_type == "Heikin Ashi":
+        o_src = ha_df["HA_O"]; c_src = ha_df["HA_C"]
+        h_src = ha_df["HA_H"]; l_src = ha_df["HA_L"]
+        cname = "Heikin Ashi"
+    else:
+        o_src = open_s; c_src = close; h_src = high_s; l_src = low_s
+        cname = "Candle"
+
+    fig.add_trace(go.Candlestick(
+        x=dates, open=o_src, high=h_src, low=l_src, close=c_src,
+        name=cname,
+        increasing_line_color=CT["green"], increasing_fillcolor=CT["green"],
+        decreasing_line_color=CT["red"],   decreasing_fillcolor=CT["red"],
+        line=dict(width=1),
+    ), row=1, col=1)
+
+    # ── Tenkan & Kijun ──
+    fig.add_trace(go.Scatter(x=dates, y=tk_s,
+                             line=dict(color=CT["tenkan"], width=1.2, dash="solid"),
+                             name="Tenkan"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=kj_s,
+                             line=dict(color=CT["kijun"], width=1.5, dash="solid"),
+                             name="Kijun"), row=1, col=1)
+
+    # ── EMA 20 / 50 ──
+    fig.add_trace(go.Scatter(x=dates, y=ema20_s,
+                             line=dict(color=CT["ema20"], width=1, dash="dot"),
+                             name="EMA20"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=ema50_s,
+                             line=dict(color=CT["ema50"], width=1, dash="dot"),
+                             name="EMA50"), row=1, col=1)
+
+    # ── VWAP ──
+    fig.add_trace(go.Scatter(x=dates, y=vwap_s,
+                             line=dict(color=CT["vwap"], width=1, dash="dashdot"),
+                             name="VWAP 20d"), row=1, col=1)
+
+    # ── Fibonacci horizontal lines ──
+    lvl = h["lvl"]
+    fib_lines = [
+        ("Target 2 (161.8%)", lvl["target_2"],    "#42a5f5", "dot"),
+        ("Target 1 / SH",     lvl["target_1"],    "#42a5f5", "solid"),
+        ("Res. 23.6%",        lvl["fib_236"],     CT["fib_col"], "dash"),
+        ("Entry Atas 38.2%",  lvl["entry_atas"],  "#66bb6a", "dash"),
+        ("Entry Bwh 50%",     lvl["entry_bawah"], "#66bb6a", "solid"),
+        ("Cutloss 61.8%",     lvl["cutloss"],     "#ef5350", "solid"),
+        ("Swing Low",         lvl["swing_low"],   "#ef5350", "dot"),
+    ]
+    x_start = dates[max(0, len(dates)-60)]  # tampilkan dari 60 bar terakhir
+    x_end   = dates[-1]
+    for label, level, color, dash in fib_lines:
+        fig.add_shape(type="line", x0=x_start, x1=x_end, y0=level, y1=level,
+                      line=dict(color=color, width=1, dash=dash), row=1, col=1)
+        fig.add_annotation(x=x_end, y=level, text=f" {label}: {level:,.0f}",
+                           showarrow=False, xanchor="left", font=dict(size=9, color=color),
+                           row=1, col=1)
+
+    # ── Harga sekarang line ──
+    fig.add_hline(y=h["harga"], line=dict(color="#ffd600", width=1.5, dash="dash"),
+                  annotation_text=f" NOW {h['harga']:,.0f}",
+                  annotation_font_color="#ffd600", annotation_font_size=10,
+                  row=1, col=1)
+
+    # ── Volume bars ──
+    vol_colors = [CT["green"] if float(close.iloc[i]) >= float(open_s.iloc[i])
+                  else CT["red"] for i in range(len(dates))]
+    fig.add_trace(go.Bar(
+        x=dates, y=vol_s,
+        marker_color=vol_colors, marker_opacity=0.6,
+        name="Volume", showlegend=False,
+    ), row=2, col=1)
+
+    # ADV20 line
+    fig.add_trace(go.Scatter(x=dates, y=adv20_s,
+                             line=dict(color="#ffd600", width=1.2, dash="dot"),
+                             name="ADV20", showlegend=True), row=2, col=1)
+
+    # ── Layout ──
+    fig.update_layout(
+        paper_bgcolor=CT["bg"], plot_bgcolor=CT["bg2"],
+        font=dict(color=CT["text"], size=11),
+        margin=dict(l=60, r=140, t=40, b=20),
+        height=640,
+        xaxis_rangeslider_visible=False,
+        legend=dict(
+            bgcolor="rgba(0,0,0,0)", font=dict(size=10),
+            orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+        ),
+        title=dict(text=f"{ticker}  ·  {candle_type}", font=dict(size=14), x=0.01),
+    )
+    for ax in ["xaxis", "xaxis2", "yaxis", "yaxis2"]:
+        fig.update_layout(**{ax: dict(
+            gridcolor=CT["grid"], zerolinecolor=CT["grid"],
+            tickfont=dict(color=CT["text"], size=10),
+        )})
+    fig.update_xaxes(showspikes=True, spikecolor=CT["grid"], spikethickness=1)
+    fig.update_yaxes(showspikes=True, spikecolor=CT["grid"], spikethickness=1)
+
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════
+# VOLUME PROFILE  (price histogram + POC + VAH + VAL)
+# ══════════════════════════════════════════════════════════════
+
+def build_volume_profile(df: pd.DataFrame, h: dict, bins: int = 40) -> go.Figure:
+    """
+    Volume profile: histogram horizontal volume per price level.
+    POC  = Price Of Control (harga dengan volume terbesar)
+    VAH  = Value Area High  (70% volume upper bound)
+    VAL  = Value Area Low   (70% volume lower bound)
+    """
+    CT   = CHART_THEME
+    close  = s(df["Close"])
+    high_s = s(df["High"])
+    low_s  = s(df["Low"])
+    vol_s  = s(df["Volume"])
+
+    # Distribusi volume ke price bucket (pakai typical price per candle)
+    typical  = (high_s + low_s + close) / 3
+    price_min, price_max = float(typical.min()), float(typical.max())
+    bin_edges = np.linspace(price_min, price_max, bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    vol_per_bin = np.zeros(bins)
+    for i in range(len(typical)):
+        idx = min(int((float(typical.iloc[i]) - price_min) /
+                      (price_max - price_min + 1e-9) * bins), bins - 1)
+        vol_per_bin[idx] += float(vol_s.iloc[i])
+
+    # POC
+    poc_idx = int(np.argmax(vol_per_bin))
+    poc     = bin_centers[poc_idx]
+
+    # Value Area (70% dari total volume di sekitar POC)
+    total_vol  = vol_per_bin.sum()
+    target_vol = total_vol * 0.70
+    va_lo_idx, va_hi_idx = poc_idx, poc_idx
+    accumulated = vol_per_bin[poc_idx]
+    while accumulated < target_vol:
+        expand_lo = va_lo_idx > 0
+        expand_hi = va_hi_idx < bins - 1
+        if not expand_lo and not expand_hi:
+            break
+        add_lo = vol_per_bin[va_lo_idx - 1] if expand_lo else 0
+        add_hi = vol_per_bin[va_hi_idx + 1] if expand_hi else 0
+        if add_hi >= add_lo:
+            va_hi_idx += 1; accumulated += vol_per_bin[va_hi_idx]
+        else:
+            va_lo_idx -= 1; accumulated += vol_per_bin[va_lo_idx]
+
+    vah = bin_centers[va_hi_idx]
+    val = bin_centers[va_lo_idx]
+
+    # ── Warna per bar: merah di bawah VAL, hijau di atas VAH, abu di VA, kuning di POC ──
+    bar_colors = []
+    for i, bc in enumerate(bin_centers):
+        if i == poc_idx:                bar_colors.append("#ffd600")
+        elif bc >= val and bc <= vah:   bar_colors.append("rgba(100,181,246,0.7)")
+        elif bc > vah:                  bar_colors.append("rgba(0,230,118,0.55)")
+        else:                           bar_colors.append("rgba(239,83,80,0.55)")
+
+    fig = go.Figure()
+
+    # Volume bars (horizontal)
+    fig.add_trace(go.Bar(
+        x=vol_per_bin,
+        y=bin_centers,
+        orientation="h",
+        marker_color=bar_colors,
+        name="Volume per level",
+        hovertemplate="Harga: %{y:,.0f}<br>Volume: %{x:,.0f}<extra></extra>",
+    ))
+
+    # POC line
+    fig.add_hline(y=poc, line=dict(color="#ffd600", width=2, dash="solid"),
+                  annotation_text=f"POC {poc:,.0f}",
+                  annotation_font_color="#ffd600", annotation_font_size=10)
+    # VAH
+    fig.add_hline(y=vah, line=dict(color="#42a5f5", width=1.2, dash="dash"),
+                  annotation_text=f"VAH {vah:,.0f}",
+                  annotation_font_color="#42a5f5", annotation_font_size=10)
+    # VAL
+    fig.add_hline(y=val, line=dict(color="#42a5f5", width=1.2, dash="dash"),
+                  annotation_text=f"VAL {val:,.0f}",
+                  annotation_font_color="#42a5f5", annotation_font_size=10)
+
+    # Harga sekarang
+    fig.add_hline(y=h["harga"], line=dict(color="#ff9800", width=2, dash="dot"),
+                  annotation_text=f"NOW {h['harga']:,.0f}",
+                  annotation_font_color="#ff9800", annotation_font_size=10)
+
+    # Fibonacci key levels
+    for label, level, color in [
+        ("Entry Atas", h["lvl"]["entry_atas"], "#66bb6a"),
+        ("Entry Bwh",  h["lvl"]["entry_bawah"],"#66bb6a"),
+        ("Cutloss",    h["lvl"]["cutloss"],     "#ef5350"),
+        ("Target 1",   h["lvl"]["target_1"],    "#42a5f5"),
+    ]:
+        fig.add_hline(y=level, line=dict(color=color, width=1, dash="dot"),
+                      annotation_text=f"{label} {level:,.0f}",
+                      annotation_font_color=color, annotation_font_size=9)
+
+    fig.update_layout(
+        paper_bgcolor=CT["bg"], plot_bgcolor=CT["bg2"],
+        font=dict(color=CT["text"], size=11),
+        height=500,
+        margin=dict(l=60, r=140, t=40, b=20),
+        title=dict(text="Volume Profile (70% Value Area)", font=dict(size=13), x=0.01),
+        xaxis=dict(title="Volume", gridcolor=CT["grid"], tickfont=dict(color=CT["text"], size=9)),
+        yaxis=dict(title="Harga", gridcolor=CT["grid"], tickfont=dict(color=CT["text"], size=9)),
+        showlegend=False,
+    )
+    return fig, poc, vah, val
+
+
+def render_charts(ticker: str, h: dict):
+    """Render chart panel lengkap — dipanggil dari mode Analisis dan Screener inline."""
+    df = download_one(ticker)
+    if df is None or df.empty:
+        st.warning("Data tidak tersedia untuk chart."); return
+
+    # Toggle candle type
+    candle_type = st.radio(
+        "Tipe candle:", ["Candle", "Heikin Ashi"],
+        horizontal=True, key=f"ctype_{ticker}"
+    )
+
+    # Lookback window chart
+    chart_bars = st.select_slider(
+        "Tampilkan berapa bar:",
+        options=[60, 90, 120, 180, 252, 365, 500, 730],
+        value=120, key=f"cbars_{ticker}"
+    )
+    df_chart = df.tail(chart_bars)
+
+    col_chart, col_vp = st.columns([3, 1])
+
+    with col_chart:
+        fig = build_chart(ticker, h, df_chart, candle_type)
+        st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+
+    with col_vp:
+        fig_vp, poc, vah, val = build_volume_profile(df_chart, h)
+        st.plotly_chart(fig_vp, use_container_width=True)
+
+        # Summary volume profile
+        harga = h["harga"]
+        st.markdown(f"""
+        <div style="font-size:0.8rem;line-height:2;">
+          <span style="color:#ffd600;">● POC</span>: {poc:,.0f}<br>
+          <span style="color:#42a5f5;">▲ VAH</span>: {vah:,.0f}
+            {'✅ di bawah' if harga < vah else '⚠️ di atas'}<br>
+          <span style="color:#42a5f5;">▼ VAL</span>: {val:,.0f}
+            {'✅ di atas' if harga > val else '⚠️ di bawah'}<br>
+          <span style="color:#ff9800;">● NOW</span>: {harga:,.0f}<br>
+          <br>
+          <span style="font-size:0.75rem;color:#8b949e;">
+          {"🟢 Harga dalam Value Area — support kuat" if val <= harga <= vah
+           else "🔼 Di atas VA — buyer dominan" if harga > vah
+           else "🔽 Di bawah VA — seller dominan"}
+          </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════
 # LOAD EMITEN
 # ══════════════════════════════════════════════════════════════
 @st.cache_data
@@ -903,7 +1259,10 @@ if "Analisis" in mode:
             render_price_ladder(h, sig)
 
             st.divider()
-            tab1, tab2, tab3 = st.tabs(["☁️ Ichimoku + EMA", "📐 Indikator Momentum", "📊 Volume + HA"])
+            tab0, tab1, tab2, tab3 = st.tabs(["📈 Chart", "☁️ Ichimoku + EMA", "📐 Indikator Momentum", "📊 Volume + HA"])
+
+            with tab0:
+                render_charts(ticker, h)
 
             with tab1:
                 d = {
@@ -1125,7 +1484,10 @@ elif "Screener" in mode:
             render_price_ladder(h, sig)
 
             st.divider()
-            tab1, tab2, tab3 = st.tabs(["☁️ Ichimoku + EMA", "📐 Momentum", "📊 Volume + HA"])
+            tab0, tab1, tab2, tab3 = st.tabs(["📈 Chart", "☁️ Ichimoku + EMA", "📐 Momentum", "📊 Volume + HA"])
+
+            with tab0:
+                render_charts(sel, h)
 
             with tab1:
                 d = {
@@ -1380,6 +1742,10 @@ Sizing lebih kecil, cutloss lebih ketat.
                 st.markdown("#### 🎯 Action Plan")
                 for a in sig.aksi:
                     st.markdown(f"<div style='font-size:0.85rem;padding:2px 0;'>{a}</div>", unsafe_allow_html=True)
+
+            st.divider()
+            st.markdown("#### 📈 Chart")
+            render_charts(eb_sel, h)
 
             st.divider()
             st.markdown("#### 📏 Price Ladder")
