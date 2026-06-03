@@ -1209,14 +1209,10 @@ with st.sidebar:
                              help="Thread paralel untuk download. Lebih tinggi = lebih cepat.")
     st.divider()
 
-    st.markdown(f"""
-    <div style="font-size:0.72rem;color:#8b949e;line-height:1.8;">
-      {'🟢 scipy' if HAS_SCIPY else '🟡 fallback pivot'}<br>
-      Ichimoku · EMA · MACD · ADX · StochRSI<br>
-      ATR · VWAP · OBV · CQS · Heikin Ashi<br>
-      Fibonacci · Early Bird · Dist. Trap
-    </div>
-    """, unsafe_allow_html=True)
+    st.caption(f"{'🟢 scipy' if HAS_SCIPY else '🟡 fallback pivot'}")
+    st.caption("Ichimoku · EMA · MACD · ADX · StochRSI")
+    st.caption("ATR · VWAP · OBV · CQS · Heikin Ashi")
+    st.caption("Fibonacci · Early Bird · Dist. Trap")
 
 
 # ══════════════════════════════════════════════════════════════
