@@ -280,7 +280,16 @@ def get_market_regime() -> MarketRegime:
         return MarketRegime("NEUTRAL","SIDEWAYS",0,0,50,f"Error IHSG: {e}",1.0)
 
 
-def render_market_regime(mr: MarketRegime):
+@st.cache_data(ttl=900, show_spinner=False)
+def _get_ihsg_cached() -> pd.DataFrame:
+    """Download IHSG sekali, cache 15 menit — dipakai RS calculation."""
+    try:
+        df = yf.download("^JKSE", period="120d", progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df.dropna(subset=["Close","Volume"]) if not df.empty else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
     """Banner kecil di atas halaman — konteks market saat ini."""
     col = {"BULL":"#00e676","NEUTRAL":"#ffc107","BEAR":"#f44336"}.get(mr.regime,"#ffc107")
     ihsg_col = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
@@ -765,6 +774,72 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
         chikou_near_free,    # chikou hampir bebas
     ])
 
+    # ── Relative Strength vs IHSG ──
+    # Butuh data IHSG — ambil dari cache market regime kalau sudah ada,
+    # atau download sekali (di-cache 15 menit)
+    rs_5d = rs_20d = rs_60d = 0.0
+    beta_60 = 1.0
+    price_relative_trend = False   # ratio saham/IHSG sedang naik?
+    vol_divergence = False         # volume naik tapi IHSG turun (akumulasi tersembunyi)
+    rs_score = 0                   # composite RS score 0-100
+
+    try:
+        df_ihsg = _get_ihsg_cached()
+        if df_ihsg is not None and not df_ihsg.empty and len(df_ihsg) >= 22:
+            ihsg_c = s(df_ihsg["Close"])
+
+            # Align panjang — pakai tanggal yang sama
+            min_len = min(len(close), len(ihsg_c))
+            c_al    = close.iloc[-min_len:].values
+            i_al    = ihsg_c.iloc[-min_len:].values
+
+            def _ret(arr, n):
+                if len(arr) > n:
+                    return (arr[-1] / arr[-n-1] - 1) * 100
+                return 0.0
+
+            ret_s5  = _ret(c_al, 5);  ret_i5  = _ret(i_al, 5)
+            ret_s20 = _ret(c_al, 20); ret_i20 = _ret(i_al, 20)
+            ret_s60 = _ret(c_al, 60); ret_i60 = _ret(i_al, 60)
+
+            rs_5d  = round(ret_s5  - ret_i5,  2)
+            rs_20d = round(ret_s20 - ret_i20, 2)
+            rs_60d = round(ret_s60 - ret_i60, 2)
+
+            # Beta 60 hari: cov(saham, IHSG) / var(IHSG)
+            if min_len >= 61:
+                s_ret = np.diff(c_al[-61:]) / c_al[-62:-1]
+                i_ret = np.diff(i_al[-61:]) / i_al[-62:-1]
+                var_i = float(np.var(i_ret))
+                beta_60 = round(float(np.cov(s_ret, i_ret)[0, 1]) / var_i, 2) if var_i > 0 else 1.0
+
+            # Price Relative Ratio trend (saham/IHSG ratio naik dalam 5 hari?)
+            if min_len >= 7:
+                pr_now  = c_al[-1]  / i_al[-1]
+                pr_5ago = c_al[-6]  / i_al[-6]
+                price_relative_trend = pr_now > pr_5ago
+
+            # Volume Divergence: IHSG turun 5 hari tapi volume saham naik
+            ihsg_down_5d = ret_i5 < -0.5
+            vol_up_5d    = float(volume.iloc[-1]) > float(volume.iloc[-6]) * 1.1 if len(volume) > 6 else False
+            vol_divergence = ihsg_down_5d and vol_up_5d and harga >= float(close.iloc[-6]) * 0.99
+
+            # RS composite score 0-100
+            # Komponen: RS5d, RS20d, RS60d, price_relative_trend, vol_divergence, beta
+            rs_pts = 0
+            if rs_5d  > 2:   rs_pts += 25
+            elif rs_5d > 0:  rs_pts += 12
+            if rs_20d > 3:   rs_pts += 25
+            elif rs_20d > 0: rs_pts += 12
+            if rs_60d > 5:   rs_pts += 20
+            elif rs_60d > 0: rs_pts += 10
+            if price_relative_trend: rs_pts += 15
+            if vol_divergence:       rs_pts += 15
+            rs_score = min(100, rs_pts)
+
+    except Exception:
+        pass  # RS gagal tidak boleh blok analisis utama
+
     return dict(
         ticker=ticker, harga=harga,
         # ichimoku
@@ -799,6 +874,12 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
         kumo_twist_recent=kumo_twist_recent, kumo_narrowing=kumo_narrowing,
         price_near_cloud=price_near_cloud, tk_cross_new=tk_cross_new,
         chikou_near_free=chikou_near_free,
+        # relative strength
+        rs_5d=rs_5d, rs_20d=rs_20d, rs_60d=rs_60d,
+        beta_60=beta_60,
+        price_relative_trend=price_relative_trend,
+        vol_divergence=vol_divergence,
+        rs_score=rs_score,
         # adaptive
         adaptive_days=adaptive_days,
     )
@@ -991,6 +1072,43 @@ def build_plan(h: dict) -> TradingSignal:
         alasan.append(f"🔥 RSI overbought ({h['rsi']:.0f}) — area mahal")
     else:
         alasan.append(f"📈 RSI {h['rsi']:.0f} — normal range")
+
+    # ── I. Relative Strength vs IHSG (bonus/penalty) ──
+    # RS score tidak masuk MAX_SCORE — dihitung sebagai bonus modifier
+    rs_bonus = 0.0
+    rs_score = h.get("rs_score", 0)
+    rs_5d    = h.get("rs_5d", 0)
+    rs_20d   = h.get("rs_20d", 0)
+    beta     = h.get("beta_60", 1.0)
+    vd       = h.get("vol_divergence", False)
+    prt      = h.get("price_relative_trend", False)
+
+    if rs_5d > 3 and rs_20d > 3:
+        rs_bonus += 1.5
+        alasan.append(f"🚀 RS sangat kuat: +{rs_5d:.1f}% vs IHSG 5d, +{rs_20d:.1f}% vs IHSG 20d")
+    elif rs_5d > 0 and rs_20d > 0:
+        rs_bonus += 0.8
+        alasan.append(f"✅ RS positif: +{rs_5d:.1f}% vs IHSG 5d, +{rs_20d:.1f}% vs IHSG 20d")
+    elif rs_5d < -3:
+        rs_bonus -= 1.0
+        alasan.append(f"⚠️ RS negatif: {rs_5d:.1f}% vs IHSG 5d — underperform market")
+
+    if beta < 0.5:
+        rs_bonus += 0.5
+        alasan.append(f"🛡️ Beta rendah ({beta:.2f}) — tidak mudah terseret jatuh saat IHSG turun")
+    elif beta > 1.5:
+        rs_bonus -= 0.3
+        alasan.append(f"⚡ Beta tinggi ({beta:.2f}) — amplify gerakan IHSG (dua arah)")
+
+    if vd:
+        rs_bonus += 1.0
+        alasan.append("🏦 Volume divergence! Volume naik saat IHSG turun — akumulasi tersembunyi")
+
+    if prt:
+        rs_bonus += 0.5
+        alasan.append("📈 Price Relative Ratio naik — saham outperform IHSG dalam 5 hari terakhir")
+
+    score += rs_bonus
 
     # ── Normalize score ke 0-100 ──
     confidence = int(min(100, max(0, (score / MAX_SCORE) * 100 + 50)))
@@ -1824,6 +1942,7 @@ with st.sidebar:
         "🚀 Screener Massal",
         "🐦 Early Bird",
         "🌡️ Sector Heatmap",
+        "💪 RS Hunter",
     ], label_visibility="collapsed")
     st.divider()
 
@@ -1844,7 +1963,7 @@ with st.sidebar:
     st.caption("Ichimoku · EMA · MACD · ADX · StochRSI")
     st.caption("ATR · VWAP · OBV · CQS · Heikin Ashi")
     st.caption("Fibonacci · Early Bird · Dist. Trap")
-    st.caption("Sector Heatmap · Sentiment AI")
+    st.caption("Sector Heatmap · Sentiment AI · RS Hunter")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1924,9 +2043,9 @@ if "Analisis" in mode:
                    f"(base {days}d, disesuaikan volatilitas & regime {mr.regime})")
 
         st.divider()
-        tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "📈 Chart", "☁️ Ichimoku + EMA", "📐 Indikator Momentum",
-            "📊 Volume + HA", "🚪 Exit Signal", "📰 Sentimen Berita"
+            "📊 Volume + HA", "🚪 Exit Signal", "💪 Relative Strength", "📰 Sentimen Berita"
         ])
 
         with tab0:
@@ -1987,6 +2106,33 @@ if "Analisis" in mode:
                 st.warning("Data tidak tersedia untuk exit signal.")
 
         with tab5:
+            st.markdown("#### 💪 Relative Strength vs IHSG")
+            st.caption("Seberapa kuat saham ini dibanding IHSG — deteksi outperformer sejati")
+
+            rs_c1, rs_c2, rs_c3, rs_c4 = st.columns(4)
+            rs_c1.metric("RS 5 Hari",  f"{h.get('rs_5d',0):+.2f}%",
+                         delta="Outperform" if h.get('rs_5d',0)>0 else "Underperform")
+            rs_c2.metric("RS 20 Hari", f"{h.get('rs_20d',0):+.2f}%",
+                         delta="Outperform" if h.get('rs_20d',0)>0 else "Underperform")
+            rs_c3.metric("RS 60 Hari", f"{h.get('rs_60d',0):+.2f}%",
+                         delta="Outperform" if h.get('rs_60d',0)>0 else "Underperform")
+            rs_c4.metric("Beta 60d",   f"{h.get('beta_60',1):.2f}",
+                         delta="Defensif" if h.get('beta_60',1)<0.7 else None)
+
+            st.divider()
+            rs_c5, rs_c6, rs_c7 = st.columns(3)
+            rs_c5.metric("RS Score",          f"{h.get('rs_score',0)}/100")
+            rs_c6.metric("Price Relative",    "📈 Naik"  if h.get('price_relative_trend') else "📉 Turun")
+            rs_c7.metric("Volume Divergence", "✅ Terdeteksi" if h.get('vol_divergence') else "❌ Tidak")
+
+            if h.get('vol_divergence'):
+                st.success("🏦 Volume divergence aktif — volume naik saat IHSG turun = akumulasi tersembunyi")
+            if h.get('rs_5d',0) > 2 and h.get('rs_20d',0) > 2:
+                st.success("🚀 RS kuat di semua timeframe — kandidat terbang saat IHSG rebound")
+            elif h.get('rs_5d',0) < 0 and h.get('rs_20d',0) < 0:
+                st.warning("⚠️ RS negatif — saham ini underperform IHSG, hindari dulu")
+
+        with tab6:
             st.markdown("#### 📰 Sentimen Berita Terkini")
             st.caption("Diambil real-time via AI web search — cache 1 jam")
             score_s, label_s = render_sentiment(ticker)
@@ -2738,3 +2884,237 @@ Sizing lebih kecil, cutloss lebih ketat.
 
             if st.button("✖ Tutup", key="eb_close"):
                 st.session_state.eb_sel = None; st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════
+# MODE 5: RS HUNTER — saham kuat saat IHSG merah
+# ══════════════════════════════════════════════════════════════
+elif "RS Hunter" in mode:
+    st.markdown("## 💪 RS Hunter — Saham Kuat Saat IHSG Merah")
+
+    mr = get_market_regime()
+    render_market_regime(mr)
+
+    st.markdown(
+        "<span style='color:#8b949e;font-size:0.85rem;'>"
+        "Cari saham yang outperform IHSG — kandidat terbang duluan saat market rebound. "
+        "Cocok dijalankan saat IHSG sedang merah/turun."
+        "</span>", unsafe_allow_html=True
+    )
+
+    with st.expander("📖 Logika RS Hunter", expanded=False):
+        st.markdown("""
+**4 metrik yang diukur:**
+- **RS Score** — composite score 0-100 dari RS 5d/20d/60d + price relative + volume divergence
+- **Beta 60d** — korelasi saham vs IHSG. Beta rendah (<0.7) = tidak mudah terseret turun
+- **Volume Divergence** — volume naik saat IHSG turun = institusi diam-diam akumulasi
+- **Price Relative Trend** — rasio saham/IHSG sedang naik dalam 5 hari
+
+**Cara pakai:**
+1. Jalankan saat IHSG merah/sedang downtrend
+2. Fokus pada RS Score ≥ 60 + vol divergence = TRUE
+3. Saham-saham ini yang akan naik duluan dan paling kencang saat IHSG rebound
+4. Kombinasikan dengan sinyal teknikal (Ichimoku) untuk timing entry
+""")
+
+    if "rs_hasil" not in st.session_state: st.session_state.rs_hasil = []
+    if "rs_raw"   not in st.session_state: st.session_state.rs_raw   = {}
+    if "rs_sel"   not in st.session_state: st.session_state.rs_sel   = None
+
+    col_b1, col_b2, col_b3 = st.columns([2, 1, 1])
+    with col_b1:
+        min_rs = st.slider("Min. RS Score", 0, 100, 40, 5, key="rs_min_score")
+    with col_b2:
+        run_rs = st.button("💪 Mulai RS Hunt", type="primary", use_container_width=True)
+    with col_b3:
+        if st.button("🔄 Reset", key="rs_reset", use_container_width=True):
+            st.session_state.rs_hasil = []; st.session_state.rs_raw = {}
+            st.session_state.rs_sel = None; st.rerun()
+
+    if run_rs:
+        st.session_state.rs_hasil = []; st.session_state.rs_raw = {}; st.session_state.rs_sel = None
+        errors_rs: list[str] = []
+
+        pbar   = st.progress(0, text="Download paralel…")
+        status = st.empty(); holder = st.empty()
+        total  = len(daftar_saham); t0 = time.time()
+
+        # Fase 1: Download paralel
+        status.markdown("⚡ Download paralel…")
+        data_map_rs: dict[str, pd.DataFrame] = {}
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            fut = {ex.submit(download_one, t): t for t in daftar_saham}
+            for f in concurrent.futures.as_completed(fut):
+                t = fut[f]
+                try:    data_map_rs[t] = f.result()
+                except: data_map_rs[t] = pd.DataFrame()
+                done += 1
+                pbar.progress(done/total/2, text=f"⚡ Download: {done}/{total}")
+
+        # Price fallback
+        rs_price_map = {}
+        for tk, df_tk in data_map_rs.items():
+            if df_tk is not None and not df_tk.empty:
+                try: rs_price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
+                except: pass
+
+        # Fase 2: RS scoring paralel
+        status.markdown("💪 RS scoring paralel…")
+
+        def _rs_worker(ticker: str) -> Optional[tuple]:
+            df_t = data_map_rs.get(ticker)
+            if df_t is None or df_t.empty: return None
+            try:
+                # Quick health check
+                if use_health:
+                    hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
+                    if not hc.lolos: return None
+
+                h = analyse(ticker, days, df=df_t, mr=mr)
+                if not h: return None
+                if ticker in rs_price_map: h["harga"] = rs_price_map[ticker]
+                if h["dist_trap"]: return None      # distribusi aktif, skip
+                if h.get("rs_score", 0) < min_rs: return None
+
+                sig = build_plan(h)
+                sig = apply_regime_to_plan(sig, mr)
+                return (ticker, h, sig)
+            except Exception as e:
+                errors_rs.append(f"{ticker}: {e}")
+                return None
+
+        rs_done  = 0
+        rs_valid = sum(1 for t in daftar_saham
+                       if data_map_rs.get(t) is not None and not data_map_rs[t].empty)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            rs_futs = {ex.submit(_rs_worker, t): t for t in daftar_saham
+                       if data_map_rs.get(t) is not None and not data_map_rs[t].empty}
+
+            for fut in concurrent.futures.as_completed(rs_futs):
+                rs_done += 1
+                pbar.progress(0.5 + rs_done/max(rs_valid,1)/2,
+                              text=f"💪 {rs_done}/{rs_valid} — {len(st.session_state.rs_hasil)} RS kuat")
+                try:
+                    result = fut.result()
+                except: continue
+                if result is None: continue
+
+                ticker_r, h, sig = result
+                st.session_state.rs_raw[ticker_r] = (h, sig)
+                st.session_state.rs_hasil.append({
+                    "Ticker":    ticker_r,
+                    "RS Score":  h.get("rs_score", 0),
+                    "RS 5d":     f"{h.get('rs_5d',0):+.1f}%",
+                    "RS 20d":    f"{h.get('rs_20d',0):+.1f}%",
+                    "RS 60d":    f"{h.get('rs_60d',0):+.1f}%",
+                    "Beta":      f"{h.get('beta_60',1):.2f}",
+                    "Vol Div":   "✅" if h.get("vol_divergence") else "—",
+                    "PR Trend":  "📈" if h.get("price_relative_trend") else "—",
+                    "Sinyal":    sig.sinyal,
+                    "Conf.":     sig.confidence,
+                    "Harga":     int(round(h["harga"])),
+                    "HA":        f"{'🟢' if h['ha_green'] else '🔴'}{h['ha_seq']}c",
+                    "IHSG Regime": mr.regime,
+                })
+
+                n = len(st.session_state.rs_hasil)
+                if n % 5 == 0 or n == 1:
+                    df_tmp = (pd.DataFrame(st.session_state.rs_hasil)
+                              .sort_values("RS Score", ascending=False).reset_index(drop=True))
+                    holder.dataframe(df_tmp, hide_index=True, use_container_width=True)
+
+        elapsed = time.time() - t0
+        pbar.progress(1.0, text=f"✅ Selesai {elapsed:.1f}s")
+        status.empty(); holder.empty()
+
+        if errors_rs:
+            with st.expander(f"⚠️ {len(errors_rs)} error"):
+                for e in errors_rs: st.text(e)
+        st.rerun()
+
+    # ── Render hasil RS Hunter ──
+    if st.session_state.rs_hasil:
+        df_rs = (pd.DataFrame(st.session_state.rs_hasil)
+                 .sort_values("RS Score", ascending=False).reset_index(drop=True))
+
+        n_vd  = df_rs["Vol Div"].eq("✅").sum()
+        n_prt = df_rs["PR Trend"].eq("📈").sum()
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total kandidat", len(df_rs))
+        m2.metric("Vol Divergence", n_vd, delta="akumulasi tersembunyi")
+        m3.metric("PR Trend naik",  n_prt)
+        m4.metric("Avg RS Score",   f"{df_rs['RS Score'].mean():.0f}/100")
+
+        if mr.regime == "BEAR":
+            st.error("🚨 Market BEAR — ini kondisi TERBAIK untuk RS Hunter. "
+                     "Saham di list ini yang paling mungkin terbang saat sentiment berbalik.")
+        elif mr.regime == "NEUTRAL":
+            st.warning("⚠️ Market sideways — RS Hunter tetap valid, fokus RS Score ≥70 + Vol Divergence.")
+        else:
+            st.info("ℹ️ Market sedang BULL — RS Hunter masih berguna untuk pilih yang terkuat.")
+
+        st.divider()
+        st.dataframe(df_rs, hide_index=True, use_container_width=True)
+        csv_rs = df_rs.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download CSV RS Hunter", csv_rs, "rs_hunter.csv", "text/csv")
+
+        st.divider()
+        st.markdown("#### 🔍 Klik untuk full report:")
+        tickers_rs = df_rs["Ticker"].tolist()
+        for row_tks in [tickers_rs[i:i+6] for i in range(0, len(tickers_rs), 6)]:
+            cols = st.columns(6)
+            for j, tk in enumerate(row_tks):
+                if tk not in st.session_state.rs_raw: continue
+                is_act = st.session_state.rs_sel == tk
+                if cols[j].button(f"{'▶ ' if is_act else ''}{tk}",
+                                  key=f"rs_btn_{tk}", use_container_width=True,
+                                  type="primary" if is_act else "secondary"):
+                    st.session_state.rs_sel = None if is_act else tk
+                    st.rerun()
+
+        rs_sel = st.session_state.rs_sel
+        if rs_sel and rs_sel in st.session_state.rs_raw:
+            h, sig = st.session_state.rs_raw[rs_sel]
+            st.divider()
+            st.markdown(f"## 💪 RS Report: `{rs_sel}`")
+
+            # RS scorecard
+            rs_cols = st.columns(6)
+            rs_cols[0].metric("RS Score",  f"{h.get('rs_score',0)}/100")
+            rs_cols[1].metric("RS 5d",     f"{h.get('rs_5d',0):+.1f}%")
+            rs_cols[2].metric("RS 20d",    f"{h.get('rs_20d',0):+.1f}%")
+            rs_cols[3].metric("RS 60d",    f"{h.get('rs_60d',0):+.1f}%")
+            rs_cols[4].metric("Beta",      f"{h.get('beta_60',1):.2f}")
+            rs_cols[5].metric("Vol Div",   "✅" if h.get("vol_divergence") else "❌")
+
+            render_banner(sig, h["harga"])
+
+            col_l, col_r = st.columns(2)
+            with col_l:
+                st.markdown("#### 🧠 Konfluensi")
+                for a in sig.alasan:
+                    st.markdown(f"<div style='font-size:0.85rem;padding:2px 0;'>{a}</div>",
+                                unsafe_allow_html=True)
+            with col_r:
+                st.markdown("#### 🎯 Action Plan")
+                for a in sig.aksi:
+                    st.markdown(f"<div style='font-size:0.85rem;padding:2px 0;'>{a}</div>",
+                                unsafe_allow_html=True)
+
+            st.divider()
+            render_price_ladder(h, sig)
+            st.divider()
+            render_charts(rs_sel, h, ctx="rshunter")
+
+            if st.button("✖ Tutup", key="rs_close"):
+                st.session_state.rs_sel = None; st.rerun()
+
+    elif not run_rs:
+        st.info(
+            "Klik **💪 Mulai RS Hunt** untuk scan semua saham dan temukan yang outperform IHSG.\n\n"
+            "**Best timing:** jalankan saat IHSG sedang merah 2–5 hari berturut-turut. "
+            "Saham dengan RS Score tinggi + Volume Divergence = yang paling likely terbang saat sentiment berbalik."
+        )
