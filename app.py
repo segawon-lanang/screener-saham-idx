@@ -290,6 +290,27 @@ def _get_ihsg_cached() -> pd.DataFrame:
         return df.dropna(subset=["Close","Volume"]) if not df.empty else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
+
+
+def render_market_regime(mr: MarketRegime):
+    """Banner IHSG regime — tampil di atas semua mode."""
+    col  = {"BULL":"#00e676","NEUTRAL":"#ffc107","BEAR":"#f44336"}.get(mr.regime,"#ffc107")
+    ihsg_col = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
+    st.markdown(f"""
+    <div style="background:#161b22;border:1px solid {col};border-radius:8px;
+                padding:0.6rem 1.2rem;margin-bottom:1rem;
+                display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
+      <span style="color:{col};font-weight:700;font-size:0.9rem;">
+        🌐 IHSG: {mr.ihsg_trend} &nbsp;|&nbsp; Regime: {mr.regime}
+      </span>
+      <span style="font-size:0.82rem;color:#8b949e;">
+        5d: <span style="color:{ihsg_col}">{mr.ihsg_change_5d:+.1f}%</span> &nbsp;·&nbsp;
+        20d: {mr.ihsg_change_20d:+.1f}% &nbsp;·&nbsp;
+        Sizing multiplier: {mr.multiplier:.0%}
+      </span>
+      <span style="font-size:0.82rem;color:{col};">{mr.warning}</span>
+    </div>
+    """, unsafe_allow_html=True)
     """Banner kecil di atas halaman — konteks market saat ini."""
     col = {"BULL":"#00e676","NEUTRAL":"#ffc107","BEAR":"#f44336"}.get(mr.regime,"#ffc107")
     ihsg_col = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
