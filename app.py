@@ -2235,26 +2235,64 @@ elif "Screener" in mode:
 
         # ── Fase 2: Analisis & scoring ──
         status.markdown("🧠 **Fase 2/2** — Analisis & scoring…")
+
+        # Pre-fetch semua live price secara paralel sebelum loop
+        # (hindari 1 HTTP call per ticker di dalam analyse())
+        def _fetch_price(tk: str, df_tk: pd.DataFrame) -> tuple:
+            fallback = float(s(df_tk["Close"]).iloc[-1]) if not df_tk.empty else 0
+            try:    return tk, float(yf.Ticker(tk).fast_info["last_price"])
+            except: return tk, fallback
+
+        status.markdown("💰 Pre-fetch harga live paralel…")
+        price_map: dict[str, float] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            pfuts = {ex.submit(_fetch_price, t, data_map.get(t, pd.DataFrame())): t
+                     for t in daftar_saham if not data_map.get(t, pd.DataFrame()).empty}
+            for pf in concurrent.futures.as_completed(pfuts):
+                try:
+                    tk, px = pf.result()
+                    price_map[tk] = px
+                except: pass
+
+        status.markdown("🧠 **Fase 2/2** — Analisis & scoring…")
+
+        UPDATE_EVERY = 5   # update tabel setiap N hasil baru (bukan setiap 1)
         for i, ticker in enumerate(daftar_saham):
             df_t = data_map.get(ticker, pd.DataFrame())
             if df_t is None or df_t.empty: continue
             try:
+                # Inject harga pre-fetched supaya analyse() tidak HTTP lagi
+                harga_pre = price_map.get(ticker)
+
+                # Filter cepat sebelum full analyse (hemat CPU)
+                close_t = s(df_t["Close"])
+                vol_t   = s(df_t["Volume"])
+                adv20_t = float(vol_t.iloc[-21:-1].mean())
+                vol_rel_quick = float(vol_t.iloc[-1]) / adv20_t if adv20_t > 0 else 0
+                if vol_rel_quick < min_vol_rel * 0.5: continue  # terlalu sepi, skip awal
+
                 h = analyse(ticker, days, df=df_t, mr=mr)
                 if not h: continue
-                # Health check filter
+
+                # Override harga dengan pre-fetched value
+                if harga_pre:
+                    h["harga"] = harga_pre
+
+                # Filter logis — urutan dari yang paling cepat dievaluasi
+                if not (h["di_atas"] and h["tk_kj"]): continue
+                if h["vol_rel"] < min_vol_rel: continue
+                if require_ha and not h["ha_green"]: continue
+
+                # Health check hanya untuk yang lolos filter logis
                 if use_health:
                     hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
                     if not hc.lolos: continue
-                if require_ha and not h["ha_green"]: continue
-                if not (h["di_atas"] and h["tk_kj"]): continue
-                if h["vol_rel"] < min_vol_rel: continue
+
                 sig = build_plan(h)
                 sig = apply_regime_to_plan(sig, mr)
                 if sig.confidence < min_conf: continue
 
-                # Simpan raw data untuk full report
                 st.session_state.screener_raw[ticker] = (h, sig)
-
                 st.session_state.screener_hasil.append({
                     "Ticker":   ticker,
                     "Sinyal":   sig.sinyal,
@@ -2271,14 +2309,17 @@ elif "Screener" in mode:
                     "Vol":      f"{h['vol_rel']:.1f}×",
                 })
 
-                df_tmp = (pd.DataFrame(st.session_state.screener_hasil)
-                          .sort_values("Conf.", ascending=False).reset_index(drop=True))
-                holder.dataframe(df_tmp, hide_index=True, use_container_width=True)
+                # Update tabel setiap UPDATE_EVERY hasil — bukan setiap 1
+                n_hasil = len(st.session_state.screener_hasil)
+                if n_hasil % UPDATE_EVERY == 0 or n_hasil == 1:
+                    df_tmp = (pd.DataFrame(st.session_state.screener_hasil)
+                              .sort_values("Conf.", ascending=False).reset_index(drop=True))
+                    holder.dataframe(df_tmp, hide_index=True, use_container_width=True)
 
             except Exception as e:
                 errors.append(f"{ticker}: {e}")
 
-            pbar.progress(0.5 + (i+1)/total/2, text=f"🧠 Analisis: {i+1}/{total}")
+            pbar.progress(0.5 + (i+1)/total/2, text=f"🧠 {i+1}/{total} — {len(st.session_state.screener_hasil)} lolos")
 
         elapsed = time.time() - t0
         pbar.progress(1.0, text=f"✅ Selesai dalam {elapsed:.1f}s")
@@ -2498,18 +2539,26 @@ Sizing lebih kecil, cutloss lebih ketat.
             df_t = data_map_eb.get(ticker, pd.DataFrame())
             if df_t is None or df_t.empty: continue
             try:
+                # Quick pre-filter sebelum full analyse
+                close_t = s(df_t["Close"])
+                vol_t   = s(df_t["Volume"])
+                adv20_t = float(vol_t.iloc[-21:-1].mean())
+                vol_rel_quick = float(vol_t.iloc[-1]) / adv20_t if adv20_t > 0 else 0
+                if vol_rel_quick < 0.2: continue   # volume mati total, skip
+
                 h = analyse(ticker, days, df=df_t, mr=mr)
                 if not h: continue
-                # Health check
+
+                # Filter early bird — urutan cepat dulu
+                if h["di_atas"]: continue
+                if h["early_score"] < min_eb_score: continue
+                if h["dist_trap"]: continue
+                if h["vol_rel"] < 0.3: continue
+
+                # Health check hanya yang lolos filter
                 if use_health:
                     hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
                     if not hc.lolos: continue
-
-                # Filter: belum breakout + cukup early signals
-                if h["di_atas"]: continue              # sudah di atas awan → bukan early bird
-                if h["early_score"] < min_eb_score: continue
-                if h["dist_trap"]: continue            # distribusi → skip
-                if h["vol_rel"] < 0.3: continue        # volume mati → skip
 
                 sig = build_plan(h)
                 sig = apply_regime_to_plan(sig, mr)
