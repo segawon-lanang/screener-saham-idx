@@ -221,6 +221,261 @@ def rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
 
 
 # ══════════════════════════════════════════════════════════════
+# MARKET REGIME  (IHSG context — filter entry saat pasar bearish)
+# ══════════════════════════════════════════════════════════════
+@dataclass
+class MarketRegime:
+    regime: str          # "BULL" / "NEUTRAL" / "BEAR"
+    ihsg_trend: str      # "UPTREND" / "SIDEWAYS" / "DOWNTREND"
+    ihsg_change_5d: float
+    ihsg_change_20d: float
+    breadth_pct: float   # % saham di atas EMA20 (dari sample)
+    warning: str         # pesan ke user
+    multiplier: float    # 1.0=normal, 0.7=hati-hati, 0.4=defensif
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_market_regime() -> MarketRegime:
+    """
+    Download IHSG (^JKSE) dan hitung regime market saat ini.
+    Regime menentukan multiplier sizing dan filter ketat/longgar.
+    """
+    try:
+        df_ihsg = yf.download("^JKSE", period="120d", progress=False, auto_adjust=True)
+        if df_ihsg.empty or len(df_ihsg) < 30:
+            return MarketRegime("NEUTRAL","SIDEWAYS",0,0,50,"Data IHSG tidak tersedia",1.0)
+
+        if isinstance(df_ihsg.columns, pd.MultiIndex):
+            df_ihsg.columns = df_ihsg.columns.get_level_values(0)
+
+        c = s(df_ihsg["Close"])
+        ema20_ihsg = float(EMAIndicator(c, window=20).ema_indicator().iloc[-1])
+        ema50_ihsg = float(EMAIndicator(c, window=50).ema_indicator().iloc[-1])
+        last       = float(c.iloc[-1])
+        chg5d      = (last / float(c.iloc[-6]) - 1) * 100 if len(c) >= 6 else 0
+        chg20d     = (last / float(c.iloc[-21]) - 1) * 100 if len(c) >= 21 else 0
+
+        # Trend IHSG
+        if last > ema20_ihsg and ema20_ihsg > ema50_ihsg and chg20d > 2:
+            ihsg_trend = "UPTREND"
+        elif last < ema20_ihsg and ema20_ihsg < ema50_ihsg and chg20d < -2:
+            ihsg_trend = "DOWNTREND"
+        else:
+            ihsg_trend = "SIDEWAYS"
+
+        # Regime final
+        if ihsg_trend == "UPTREND" and chg5d > -1:
+            regime, mult, warn = "BULL",    1.0, "✅ Market BULL — sinyal lebih reliable"
+        elif ihsg_trend == "DOWNTREND" or chg5d < -3:
+            regime, mult, warn = "BEAR",    0.4, "🚨 Market BEAR — kurangi sizing 60%, prioritas cash"
+        else:
+            regime, mult, warn = "NEUTRAL", 0.7, "⚠️ Market SIDEWAYS — sizing 70%, selektif"
+
+        return MarketRegime(
+            regime=regime, ihsg_trend=ihsg_trend,
+            ihsg_change_5d=round(chg5d,2), ihsg_change_20d=round(chg20d,2),
+            breadth_pct=50.0,   # diupdate saat screener jalan
+            warning=warn, multiplier=mult,
+        )
+    except Exception as e:
+        return MarketRegime("NEUTRAL","SIDEWAYS",0,0,50,f"Error IHSG: {e}",1.0)
+
+
+def render_market_regime(mr: MarketRegime):
+    """Banner kecil di atas halaman — konteks market saat ini."""
+    col = {"BULL":"#00e676","NEUTRAL":"#ffc107","BEAR":"#f44336"}.get(mr.regime,"#ffc107")
+    ihsg_col = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
+    st.markdown(f"""
+    <div style="background:#161b22;border:1px solid {col};border-radius:8px;
+                padding:0.6rem 1.2rem;margin-bottom:1rem;
+                display:flex;align-items:center;justify-content:space-between;">
+      <span style="color:{col};font-weight:700;font-size:0.9rem;">
+        🌐 IHSG: {mr.ihsg_trend} &nbsp;|&nbsp; Regime: {mr.regime}
+      </span>
+      <span style="font-size:0.82rem;color:#8b949e;">
+        5d: <span style="color:{ihsg_col}">{mr.ihsg_change_5d:+.1f}%</span> &nbsp;·&nbsp;
+        20d: {mr.ihsg_change_20d:+.1f}% &nbsp;·&nbsp;
+        Sizing multiplier: {mr.multiplier:.0%}
+      </span>
+      <span style="font-size:0.82rem;color:{col};">{mr.warning}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════
+# ADAPTIVE FIBONACCI  (lookback menyesuaikan regime & volatilitas)
+# ══════════════════════════════════════════════════════════════
+def adaptive_lookback(df: pd.DataFrame, base_days: int, mr: MarketRegime) -> int:
+    """
+    Sesuaikan lookback Fibonacci berdasarkan:
+    - Volatilitas saham (ATR%): saham volatile → lookback lebih panjang
+    - Market regime: BEAR → lookback lebih pendek (swing lebih dekat)
+    - ADX: trending kuat → lookback lebih panjang untuk tangkap swing besar
+    """
+    close = s(df["Close"])
+    high  = s(df["High"])
+    low   = s(df["Low"])
+
+    atr_pct = float(
+        AverageTrueRange(high, low, close, window=14)
+        .average_true_range().iloc[-1]
+    ) / float(close.iloc[-1]) * 100
+
+    adx_val = float(
+        s(ADXIndicator(high, low, close, window=14).adx()).iloc[-1]
+    )
+
+    # Base adjustment
+    adj = base_days
+
+    # Volatilitas tinggi → panjangkan lookback (swing lebih ekstrem)
+    if atr_pct > 3.0:   adj = int(adj * 1.3)
+    elif atr_pct < 1.0: adj = int(adj * 0.8)
+
+    # Trending kuat → panjangkan (swing primer lebih relevan)
+    if adx_val > 35:    adj = int(adj * 1.2)
+
+    # Bear market → persingkat (swing baru lebih relevan dari swing lama)
+    if mr.regime == "BEAR":  adj = int(adj * 0.7)
+
+    return max(30, min(365, adj))
+
+
+# ══════════════════════════════════════════════════════════════
+# EXIT SIGNAL ENGINE
+# ══════════════════════════════════════════════════════════════
+@dataclass
+class ExitSignal:
+    level: str       # "HOLD" / "WATCH" / "PARTIAL_EXIT" / "FULL_EXIT"
+    alasan: list[str]
+    aksi: list[str]
+    urgency: int     # 0=hold, 1=watch, 2=partial, 3=exit sekarang
+
+def build_exit_signal(h: dict, df: pd.DataFrame) -> ExitSignal:
+    """
+    Deteksi sinyal exit dari posisi yang sudah dipegang.
+    Berjalan independen dari entry signal — khusus untuk position management.
+    """
+    alasan: list[str] = []
+    aksi:   list[str] = []
+    exit_score = 0    # makin tinggi makin perlu exit
+
+    close  = s(df["Close"])
+    high_s = s(df["High"])
+    low_s  = s(df["Low"])
+    lvl    = h["lvl"]
+
+    # ── 1. HA berubah merah setelah konsisten hijau ──
+    ha_df   = heikin_ashi(df)
+    ha_c    = ha_df["HA_C"].values
+    ha_o    = ha_df["HA_O"].values
+    # Hitung berapa candle hijau sebelum yang terakhir
+    was_green_streak = 0
+    for i in range(len(ha_c)-2, max(0, len(ha_c)-10), -1):
+        if ha_c[i] > ha_o[i]: was_green_streak += 1
+        else: break
+    ha_just_turned_red = (ha_c[-1] < ha_o[-1]) and was_green_streak >= 3
+    if ha_just_turned_red:
+        exit_score += 2
+        alasan.append(f"🔴 HA baru berubah merah setelah {was_green_streak} candle hijau — momentum berbalik")
+        aksi.append("📤 Partial exit 50% posisi — lindungi profit")
+
+    # ── 2. TK cross DOWN (Tenkan potong Kijun dari atas ke bawah) ──
+    ichi    = IchimokuIndicator(high=high_s, low=low_s)
+    tk_s    = s(ichi.ichimoku_conversion_line())
+    kj_s    = s(ichi.ichimoku_base_line())
+    tk_kj_diff = tk_s - kj_s
+    tk_cross_down = (float(tk_kj_diff.iloc[-1]) < 0) and (float(tk_kj_diff.iloc[-2]) >= 0)
+    if tk_cross_down:
+        exit_score += 2
+        alasan.append("⚡ Tenkan cross DOWN Kijun — sinyal exit Ichimoku klasik")
+        aksi.append("🛑 Exit atau reduce signifikan — TK cross down adalah sinyal bearish kuat")
+
+    # ── 3. MACD cross DOWN dari zona positif ──
+    macd_obj  = MACD(close)
+    macd_hist = s(macd_obj.macd_diff())
+    macd_cross_down = (float(macd_hist.iloc[-1]) < 0) and (float(macd_hist.iloc[-2]) >= 0)
+    if macd_cross_down:
+        exit_score += 1
+        alasan.append(f"📉 MACD cross DOWN — momentum bullish habis (hist: {float(macd_hist.iloc[-1]):+.3f})")
+
+    # ── 4. Harga menyentuh / melewati Target 1 ──
+    if h["harga"] >= lvl["target_1"] * 0.98:
+        exit_score += 1
+        alasan.append(f"🎯 Harga mendekati Target 1 ({lvl['target_1']:,.0f}) — area take profit")
+        aksi.append(f"💰 Take profit 50–70% di sekitar {lvl['target_1']:,.0f}")
+        aksi.append(f"🔒 Sisakan 30% untuk kejar Target 2 ({lvl['target_2']:,.0f})")
+
+    # ── 5. Distribution trap setelah posisi masuk ──
+    if h["dist_trap"]:
+        exit_score += 2
+        alasan.append("🚨 Distribution trap terdeteksi — institusi kemungkinan mulai distribusi")
+        aksi.append("📤 Pertimbangkan exit 50–75% sekarang")
+
+    # ── 6. Harga turun ke bawah cutloss ──
+    if h["harga"] < lvl["cutloss"]:
+        exit_score = 10   # override — wajib exit
+        alasan.append(f"🛑 Harga {h['harga']:,.0f} di bawah cutloss {lvl['cutloss']:,.0f} — CUTLOSS!")
+        aksi.append("❗ CUTLOSS SEKARANG — jangan averaging down, lindungi modal")
+
+    # ── 7. Volume spike merah (selling climax?) ──
+    adv20   = float(s(df["Volume"]).iloc[-21:-1].mean())
+    vol_now = float(s(df["Volume"]).iloc[-1])
+    vol_rel = vol_now / adv20 if adv20 > 0 else 1
+    if vol_rel > 3 and not h["ha_green"] and h["cqs"] < 0.4:
+        exit_score += 2
+        alasan.append(f"📊 Volume {vol_rel:.1f}×ADV + candle merah + CQS {h['cqs']:.2f} — selling pressure besar")
+
+    # ── 8. StochRSI overbought ekstrem ──
+    if h["srsi_k"] > 90:
+        exit_score += 1
+        alasan.append(f"🔥 StochRSI sangat overbought ({h['srsi_k']:.0f}) — potensi reversal tajam")
+
+    # ── Tentukan level exit ──
+    if exit_score == 0:
+        level   = "HOLD"
+        urgency = 0
+        alasan.append("✅ Tidak ada sinyal exit — posisi aman, lanjutkan hold")
+        aksi.append(f"👁️ Monitor: alert jika close di bawah {lvl['cutloss']:,.0f}")
+    elif exit_score <= 1:
+        level   = "WATCH"
+        urgency = 1
+        aksi.insert(0, "👁️ Mulai perketat monitoring — belum perlu exit tapi waspadai")
+    elif exit_score <= 3:
+        level   = "PARTIAL_EXIT"
+        urgency = 2
+        if not aksi:
+            aksi.insert(0, "📤 Partial exit 30–50% — amankan sebagian profit")
+    else:
+        level   = "FULL_EXIT"
+        urgency = 3
+        if not any("CUTLOSS" in a or "exit" in a.lower() for a in aksi):
+            aksi.insert(0, "🚨 Pertimbangkan full exit — multiple sinyal negatif sekaligus")
+
+    return ExitSignal(level=level, alasan=alasan, aksi=aksi, urgency=urgency)
+
+
+def render_exit_signal(ex: ExitSignal):
+    color = {"HOLD":"#00e676","WATCH":"#ffc107","PARTIAL_EXIT":"#ff9800","FULL_EXIT":"#f44336"}.get(ex.level,"#ffc107")
+    icon  = {"HOLD":"✅","WATCH":"👁️","PARTIAL_EXIT":"📤","FULL_EXIT":"🚨"}.get(ex.level,"⚠️")
+    label = ex.level.replace("_"," ")
+    st.markdown(f"""
+    <div style="background:#161b22;border:1px solid {color};border-radius:10px;
+                padding:1rem 1.4rem;margin:0.8rem 0;">
+      <div style="font-size:1.1rem;font-weight:700;color:{color};margin-bottom:0.5rem;">
+        {icon} EXIT SIGNAL: {label}
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+    col_l, col_r = st.columns(2)
+    with col_l:
+        st.markdown("**Alasan:**")
+        for a in ex.alasan: st.markdown(f"- {a}")
+    with col_r:
+        st.markdown("**Aksi:**")
+        for a in ex.aksi: st.markdown(f"- {a}")
+
+
+# ══════════════════════════════════════════════════════════════
 # LIQUIDITY & HEALTH FILTER
 # ══════════════════════════════════════════════════════════════
 @dataclass
@@ -344,11 +599,17 @@ def download_batch_parallel(tickers: list[str], max_workers: int = 8) -> dict[st
 # ══════════════════════════════════════════════════════════════
 # FULL ANALYSER  (semua indikator dalam satu pass)
 # ══════════════════════════════════════════════════════════════
-def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None) -> Optional[dict]:
+def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
+            mr: Optional[MarketRegime] = None) -> Optional[dict]:
     if df is None:
         df = download_one(ticker)
     if df is None or df.empty:
         return None
+
+    # Adaptive lookback — sesuaikan dengan volatilitas & regime
+    if mr is None:
+        mr = get_market_regime()
+    adaptive_days = adaptive_lookback(df, days, mr)
 
     close  = s(df["Close"])
     high   = s(df["High"])
@@ -415,8 +676,8 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None) -> Option
                  volume.rolling(20).sum().iloc[-1])
     price_above_vwap = harga > vwap
 
-    # ── Fibonacci ──
-    sh, sl = recent_swings(df, days)
+    # ── Fibonacci (adaptive lookback) ──
+    sh, sl = recent_swings(df, adaptive_days)
     diff = sh - sl
     lvl = {
         "target_2"   : sh + diff * 0.618,
@@ -538,6 +799,8 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None) -> Option
         kumo_twist_recent=kumo_twist_recent, kumo_narrowing=kumo_narrowing,
         price_near_cloud=price_near_cloud, tk_cross_new=tk_cross_new,
         chikou_near_free=chikou_near_free,
+        # adaptive
+        adaptive_days=adaptive_days,
     )
 
 
@@ -815,6 +1078,27 @@ def build_plan(h: dict) -> TradingSignal:
         target_1=lvl["target_1"], target_2=lvl["target_2"],
         rr=rr_val, sizing_pct=sizing, atr_sizing=atr_label,
     )
+
+
+def apply_regime_to_plan(sig: TradingSignal, mr: MarketRegime) -> TradingSignal:
+    """
+    Post-process: sesuaikan sizing dengan market regime multiplier.
+    Bear market → sizing dikurangi otomatis, tambah warning di aksi.
+    """
+    if mr.regime == "BEAR" and sig.sizing_pct and sig.sizing_pct > 0:
+        orig = sig.sizing_pct
+        adjusted = max(0, int(orig * mr.multiplier))
+        sig.sizing_pct = adjusted
+        if adjusted == 0:
+            sig.aksi.insert(0, f"🚨 Market BEAR — sizing 0% (skip entry meski sinyal bagus)")
+        else:
+            sig.aksi.insert(0, f"🌐 Market BEAR: sizing dikurangi {orig}% → {adjusted}% (×{mr.multiplier:.0%} regime multiplier)")
+    elif mr.regime == "NEUTRAL" and sig.sizing_pct and sig.sizing_pct > 0:
+        orig = sig.sizing_pct
+        adjusted = max(0, int(orig * mr.multiplier))
+        sig.sizing_pct = adjusted
+        sig.aksi.insert(0, f"🌐 Market SIDEWAYS: sizing disesuaikan {orig}% → {adjusted}%")
+    return sig
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1569,6 +1853,10 @@ with st.sidebar:
 if "Analisis" in mode:
     st.markdown("## 🔍 Analisis Spesifik")
 
+    # Market regime banner
+    mr = get_market_regime()
+    render_market_regime(mr)
+
     c1, c2 = st.columns([4, 1])
     with c1:
         ticker = st.selectbox("Saham", daftar_saham, label_visibility="collapsed",
@@ -1585,17 +1873,17 @@ if "Analisis" in mode:
 
     if run:
         with st.spinner(f"Menganalisis {ticker}…"):
-            h_new = analyse(ticker, days)
+            h_new = analyse(ticker, days, mr=mr)
         if not h_new:
             st.error("Data tidak cukup atau ticker tidak valid.")
         else:
             sig_new = build_plan(h_new)
+            sig_new = apply_regime_to_plan(sig_new, mr)
             hc_new  = None
             if use_health:
                 df_hc = download_one(ticker)
                 hc_new = health_check(df_hc, ticker,
                                       min_price=min_price, min_adv_juta=min_adv_juta)
-            # Simpan ke session_state — tetap ada saat chart di-interact
             st.session_state["_analisis_h"]            = h_new
             st.session_state["_analisis_sig"]          = sig_new
             st.session_state["_analisis_hc"]           = hc_new
@@ -1631,10 +1919,14 @@ if "Analisis" in mode:
         st.markdown("#### 📏 Price Ladder")
         render_price_ladder(h, sig)
 
+        # Adaptive lookback info
+        st.caption(f"📐 Lookback Fibonacci adaptive: **{h.get('adaptive_days', days)} hari** "
+                   f"(base {days}d, disesuaikan volatilitas & regime {mr.regime})")
+
         st.divider()
-        tab0, tab1, tab2, tab3, tab4 = st.tabs([
+        tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "📈 Chart", "☁️ Ichimoku + EMA", "📐 Indikator Momentum",
-            "📊 Volume + HA", "📰 Sentimen Berita"
+            "📊 Volume + HA", "🚪 Exit Signal", "📰 Sentimen Berita"
         ])
 
         with tab0:
@@ -1681,6 +1973,20 @@ if "Analisis" in mode:
             c4.metric("Early Bird Score", f"{h['early_score']}/5")
 
         with tab4:
+            st.markdown("#### 🚪 Exit Signal — Manajemen Posisi")
+            st.caption("Khusus jika kamu sudah pegang saham ini — cek apakah perlu hold, partial exit, atau cut")
+            df_exit = download_one(ticker)
+            if df_exit is not None and not df_exit.empty:
+                ex = build_exit_signal(h, df_exit)
+                render_exit_signal(ex)
+                # Adaptive exit info
+                st.divider()
+                st.caption(f"🌐 Regime market saat ini: **{mr.regime}** — "
+                           f"{'exit lebih agresif di bear market' if mr.regime == 'BEAR' else 'normal exit rules berlaku'}")
+            else:
+                st.warning("Data tidak tersedia untuk exit signal.")
+
+        with tab5:
             st.markdown("#### 📰 Sentimen Berita Terkini")
             st.caption("Diambil real-time via AI web search — cache 1 jam")
             score_s, label_s = render_sentiment(ticker)
@@ -1700,6 +2006,8 @@ if "Analisis" in mode:
 # ══════════════════════════════════════════════════════════════
 elif "Heatmap" in mode:
     st.markdown("## 🌡️ Sector Heatmap")
+    mr = get_market_regime()
+    render_market_regime(mr)
     st.markdown(
         "<span style='color:#8b949e;font-size:0.85rem;'>"
         "Lihat sektor mana yang paling banyak sinyal BUY — "
@@ -1744,9 +2052,10 @@ elif "Heatmap" in mode:
                 if use_health:
                     hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
                     if not hc.lolos: continue
-                h = analyse(ticker, days, df=df_t)
+                h = analyse(ticker, days, df=df_t, mr=mr)
                 if not h: continue
                 sig = build_plan(h)
+                sig = apply_regime_to_plan(sig, mr)
                 sektor = get_sektor(ticker)
                 st.session_state.heatmap_hasil.append({
                     "Ticker": ticker, "Sektor": sektor,
@@ -1871,6 +2180,8 @@ elif "Heatmap" in mode:
 # ══════════════════════════════════════════════════════════════
 elif "Screener" in mode:
     st.markdown("## 🚀 Screener Massal")
+    mr = get_market_regime()
+    render_market_regime(mr)
     st.markdown(
         f"<span style='color:#8b949e;font-size:0.85rem;'>"
         f"Filter: Ichimoku Uptrend · {'HA Hijau · ' if require_ha else ''}"
@@ -1928,7 +2239,7 @@ elif "Screener" in mode:
             df_t = data_map.get(ticker, pd.DataFrame())
             if df_t is None or df_t.empty: continue
             try:
-                h = analyse(ticker, days, df=df_t)
+                h = analyse(ticker, days, df=df_t, mr=mr)
                 if not h: continue
                 # Health check filter
                 if use_health:
@@ -1938,6 +2249,7 @@ elif "Screener" in mode:
                 if not (h["di_atas"] and h["tk_kj"]): continue
                 if h["vol_rel"] < min_vol_rel: continue
                 sig = build_plan(h)
+                sig = apply_regime_to_plan(sig, mr)
                 if sig.confidence < min_conf: continue
 
                 # Simpan raw data untuk full report
@@ -2112,6 +2424,8 @@ elif "Screener" in mode:
 # ══════════════════════════════════════════════════════════════
 elif "Early Bird" in mode:
     st.markdown("## 🐦 Early Bird Screener")
+    mr = get_market_regime()
+    render_market_regime(mr)
     st.markdown(
         "<span style='color:#8b949e;font-size:0.85rem;'>"
         "Deteksi saham yang **belum** breakout tapi sinyal Ichimoku mulai terbentuk "
@@ -2184,7 +2498,7 @@ Sizing lebih kecil, cutloss lebih ketat.
             df_t = data_map_eb.get(ticker, pd.DataFrame())
             if df_t is None or df_t.empty: continue
             try:
-                h = analyse(ticker, days, df=df_t)
+                h = analyse(ticker, days, df=df_t, mr=mr)
                 if not h: continue
                 # Health check
                 if use_health:
@@ -2198,6 +2512,7 @@ Sizing lebih kecil, cutloss lebih ketat.
                 if h["vol_rel"] < 0.3: continue        # volume mati → skip
 
                 sig = build_plan(h)
+                sig = apply_regime_to_plan(sig, mr)
                 st.session_state.eb_raw[ticker] = (h, sig)
 
                 # Early bird label per sinyal
