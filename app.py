@@ -2233,68 +2233,90 @@ elif "Screener" in mode:
         dl_time = time.time() - t0
         status.markdown(f"✅ **Fase 1 selesai** — {total} ticker diunduh dalam **{dl_time:.1f}s**")
 
-        # ── Fase 2: Analisis & scoring ──
-        status.markdown("🧠 **Fase 2/2** — Analisis & scoring…")
+        # ── Fase 2: Analisis & scoring — PARALEL ──
+        status.markdown("🧠 **Fase 2/2** — Analisis paralel + scoring…")
 
-        # Pre-fetch semua live price secara paralel sebelum loop
-        # (hindari 1 HTTP call per ticker di dalam analyse())
-        def _fetch_price(tk: str, df_tk: pd.DataFrame) -> tuple:
-            fallback = float(s(df_tk["Close"]).iloc[-1]) if not df_tk.empty else 0
-            try:    return tk, float(yf.Ticker(tk).fast_info["last_price"])
-            except: return tk, fallback
-
-        status.markdown("💰 Pre-fetch harga live paralel…")
+        # Ambil close terakhir sebagai fallback harga (tanpa HTTP)
         price_map: dict[str, float] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            pfuts = {ex.submit(_fetch_price, t, data_map.get(t, pd.DataFrame())): t
-                     for t in daftar_saham if not data_map.get(t, pd.DataFrame()).empty}
-            for pf in concurrent.futures.as_completed(pfuts):
-                try:
-                    tk, px = pf.result()
-                    price_map[tk] = px
+        for tk, df_tk in data_map.items():
+            if df_tk is not None and not df_tk.empty:
+                try: price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
                 except: pass
 
-        status.markdown("🧠 **Fase 2/2** — Analisis & scoring…")
-
-        UPDATE_EVERY = 5   # update tabel setiap N hasil baru (bukan setiap 1)
-        for i, ticker in enumerate(daftar_saham):
-            df_t = data_map.get(ticker, pd.DataFrame())
-            if df_t is None or df_t.empty: continue
+        def _analyse_worker(ticker: str) -> Optional[tuple]:
+            """Jalankan full pipeline satu ticker — dipanggil dari thread pool."""
+            df_t = data_map.get(ticker)
+            if df_t is None or df_t.empty:
+                return None
             try:
-                # Inject harga pre-fetched supaya analyse() tidak HTTP lagi
-                harga_pre = price_map.get(ticker)
-
-                # Filter cepat sebelum full analyse (hemat CPU)
-                close_t = s(df_t["Close"])
-                vol_t   = s(df_t["Volume"])
-                adv20_t = float(vol_t.iloc[-21:-1].mean())
-                vol_rel_quick = float(vol_t.iloc[-1]) / adv20_t if adv20_t > 0 else 0
-                if vol_rel_quick < min_vol_rel * 0.5: continue  # terlalu sepi, skip awal
+                # Quick volume pre-filter (murah, tanpa kalkulasi indikator)
+                vol_t  = s(df_t["Volume"])
+                adv20t = float(vol_t.iloc[-21:-1].mean())
+                if adv20t > 0 and float(vol_t.iloc[-1]) / adv20t < min_vol_rel * 0.4:
+                    return None
 
                 h = analyse(ticker, days, df=df_t, mr=mr)
-                if not h: continue
+                if not h:
+                    return None
 
-                # Override harga dengan pre-fetched value
-                if harga_pre:
-                    h["harga"] = harga_pre
+                # Pakai harga dari price_map (close terakhir) — tidak ada HTTP
+                if ticker in price_map:
+                    h["harga"] = price_map[ticker]
 
-                # Filter logis — urutan dari yang paling cepat dievaluasi
-                if not (h["di_atas"] and h["tk_kj"]): continue
-                if h["vol_rel"] < min_vol_rel: continue
-                if require_ha and not h["ha_green"]: continue
+                # Filter logis cepat
+                if not (h["di_atas"] and h["tk_kj"]):
+                    return None
+                if h["vol_rel"] < min_vol_rel:
+                    return None
+                if require_ha and not h["ha_green"]:
+                    return None
 
-                # Health check hanya untuk yang lolos filter logis
+                # Health check
                 if use_health:
-                    hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
-                    if not hc.lolos: continue
+                    hc = health_check(df_t, ticker,
+                                      min_price=min_price, min_adv_juta=min_adv_juta)
+                    if not hc.lolos:
+                        return None
 
                 sig = build_plan(h)
                 sig = apply_regime_to_plan(sig, mr)
-                if sig.confidence < min_conf: continue
+                if sig.confidence < min_conf:
+                    return None
 
-                st.session_state.screener_raw[ticker] = (h, sig)
+                return (ticker, h, sig)
+
+            except Exception as e:
+                errors.append(f"{ticker}: {e}")
+                return None
+
+        # Jalankan semua worker paralel
+        done_count  = 0
+        total_valid = sum(1 for t in daftar_saham
+                         if data_map.get(t) is not None and not data_map[t].empty)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_analyse_worker, t): t for t in daftar_saham
+                    if data_map.get(t) is not None and not data_map[t].empty}
+
+            for fut in concurrent.futures.as_completed(futs):
+                done_count += 1
+                pbar.progress(
+                    0.5 + done_count / max(total_valid, 1) / 2,
+                    text=f"🧠 {done_count}/{total_valid} — {len(st.session_state.screener_hasil)} lolos"
+                )
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    errors.append(str(e))
+                    continue
+
+                if result is None:
+                    continue
+
+                ticker_r, h, sig = result
+                st.session_state.screener_raw[ticker_r] = (h, sig)
                 st.session_state.screener_hasil.append({
-                    "Ticker":   ticker,
+                    "Ticker":   ticker_r,
                     "Sinyal":   sig.sinyal,
                     "Conf.":    sig.confidence,
                     "Harga":    int(round(h["harga"])),
@@ -2309,17 +2331,13 @@ elif "Screener" in mode:
                     "Vol":      f"{h['vol_rel']:.1f}×",
                 })
 
-                # Update tabel setiap UPDATE_EVERY hasil — bukan setiap 1
-                n_hasil = len(st.session_state.screener_hasil)
-                if n_hasil % UPDATE_EVERY == 0 or n_hasil == 1:
+                # Update tabel setiap 5 hasil baru
+                n = len(st.session_state.screener_hasil)
+                if n % 5 == 0 or n == 1:
                     df_tmp = (pd.DataFrame(st.session_state.screener_hasil)
-                              .sort_values("Conf.", ascending=False).reset_index(drop=True))
+                              .sort_values("Conf.", ascending=False)
+                              .reset_index(drop=True))
                     holder.dataframe(df_tmp, hide_index=True, use_container_width=True)
-
-            except Exception as e:
-                errors.append(f"{ticker}: {e}")
-
-            pbar.progress(0.5 + (i+1)/total/2, text=f"🧠 {i+1}/{total} — {len(st.session_state.screener_hasil)} lolos")
 
         elapsed = time.time() - t0
         pbar.progress(1.0, text=f"✅ Selesai dalam {elapsed:.1f}s")
@@ -2533,38 +2551,66 @@ Sizing lebih kecil, cutloss lebih ketat.
                 done += 1
                 pbar.progress(done / total / 2, text=f"⚡ Download: {done}/{total}")
 
-        # Fase 2: scan early bird
-        status.markdown("🐦 Scanning early signals…")
-        for i, ticker in enumerate(daftar_saham):
-            df_t = data_map_eb.get(ticker, pd.DataFrame())
-            if df_t is None or df_t.empty: continue
+        # Fase 2: scan early bird — PARALEL
+        status.markdown("🐦 Scanning early signals paralel…")
+
+        # Price fallback dari close terakhir
+        eb_price_map = {}
+        for tk, df_tk in data_map_eb.items():
+            if df_tk is not None and not df_tk.empty:
+                try: eb_price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
+                except: pass
+
+        def _eb_worker(ticker: str) -> Optional[tuple]:
+            df_t = data_map_eb.get(ticker)
+            if df_t is None or df_t.empty: return None
             try:
-                # Quick pre-filter sebelum full analyse
-                close_t = s(df_t["Close"])
-                vol_t   = s(df_t["Volume"])
-                adv20_t = float(vol_t.iloc[-21:-1].mean())
-                vol_rel_quick = float(vol_t.iloc[-1]) / adv20_t if adv20_t > 0 else 0
-                if vol_rel_quick < 0.2: continue   # volume mati total, skip
+                vol_t  = s(df_t["Volume"])
+                adv20t = float(vol_t.iloc[-21:-1].mean())
+                if adv20t > 0 and float(vol_t.iloc[-1]) / adv20t < 0.15: return None
 
                 h = analyse(ticker, days, df=df_t, mr=mr)
-                if not h: continue
+                if not h: return None
+                if ticker in eb_price_map: h["harga"] = eb_price_map[ticker]
 
-                # Filter early bird — urutan cepat dulu
-                if h["di_atas"]: continue
-                if h["early_score"] < min_eb_score: continue
-                if h["dist_trap"]: continue
-                if h["vol_rel"] < 0.3: continue
+                if h["di_atas"]: return None
+                if h["early_score"] < min_eb_score: return None
+                if h["dist_trap"]: return None
+                if h["vol_rel"] < 0.3: return None
 
-                # Health check hanya yang lolos filter
                 if use_health:
                     hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
-                    if not hc.lolos: continue
+                    if not hc.lolos: return None
 
                 sig = build_plan(h)
                 sig = apply_regime_to_plan(sig, mr)
-                st.session_state.eb_raw[ticker] = (h, sig)
+                return (ticker, h, sig)
+            except Exception as e:
+                errors_eb.append(f"{ticker}: {e}")
+                return None
 
-                # Early bird label per sinyal
+        eb_done = 0
+        eb_valid = sum(1 for t in daftar_saham
+                       if data_map_eb.get(t) is not None and not data_map_eb[t].empty)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            eb_futs = {ex.submit(_eb_worker, t): t for t in daftar_saham
+                       if data_map_eb.get(t) is not None and not data_map_eb[t].empty}
+
+            for fut in concurrent.futures.as_completed(eb_futs):
+                eb_done += 1
+                pbar.progress(
+                    0.5 + eb_done / max(eb_valid, 1) / 2,
+                    text=f"🐦 {eb_done}/{eb_valid} — {len(st.session_state.eb_hasil)} early bird"
+                )
+                try:
+                    result = fut.result()
+                except: continue
+                if result is None: continue
+
+                ticker_r, h, sig = result
+                st.session_state.eb_raw[ticker_r] = (h, sig)
+
                 eb_signals = []
                 if h["kumo_twist_recent"]: eb_signals.append("🌀Twist")
                 if h["kumo_narrowing"]:    eb_signals.append("📉Sempit")
@@ -2573,7 +2619,7 @@ Sizing lebih kecil, cutloss lebih ketat.
                 if h["chikou_near_free"]:  eb_signals.append("👁️Chikou")
 
                 st.session_state.eb_hasil.append({
-                    "Ticker":      ticker,
+                    "Ticker":      ticker_r,
                     "EB Score":    f"{h['early_score']}/5",
                     "Sinyal":      " ".join(eb_signals),
                     "Harga":       int(round(h["harga"])),
@@ -2585,13 +2631,11 @@ Sizing lebih kecil, cutloss lebih ketat.
                     "RSI":         f"{h['rsi']:.0f}",
                 })
 
-                df_tmp = pd.DataFrame(st.session_state.eb_hasil).sort_values("EB Score", ascending=False)
-                holder.dataframe(df_tmp, hide_index=True, use_container_width=True)
-
-            except Exception as e:
-                errors_eb.append(f"{ticker}: {e}")
-
-            pbar.progress(0.5 + (i+1)/total/2, text=f"🐦 Scan: {i+1}/{total}")
+                n = len(st.session_state.eb_hasil)
+                if n % 5 == 0 or n == 1:
+                    df_tmp = (pd.DataFrame(st.session_state.eb_hasil)
+                              .sort_values("EB Score", ascending=False))
+                    holder.dataframe(df_tmp, hide_index=True, use_container_width=True)
 
         elapsed = time.time() - t0
         pbar.progress(1.0, text=f"✅ Selesai {elapsed:.1f}s")
