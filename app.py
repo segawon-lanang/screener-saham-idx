@@ -1988,14 +1988,17 @@ with st.sidebar:
 
 
 # ══════════════════════════════════════════════════════════════
+# GLOBAL: fetch market regime SEKALI, render banner SEKALI
+# ══════════════════════════════════════════════════════════════
+mr = get_market_regime()
+render_market_regime(mr)
+
+
+# ══════════════════════════════════════════════════════════════
 # MODE 1: ANALISIS + TRADING PLAN
 # ══════════════════════════════════════════════════════════════
 if "Analisis" in mode:
     st.markdown("## 🔍 Analisis Spesifik")
-
-    # Market regime banner
-    mr = get_market_regime()
-    render_market_regime(mr)
 
     c1, c2 = st.columns([4, 1])
     with c1:
@@ -2173,8 +2176,6 @@ if "Analisis" in mode:
 # ══════════════════════════════════════════════════════════════
 elif "Heatmap" in mode:
     st.markdown("## 🌡️ Sector Heatmap")
-    mr = get_market_regime()
-    render_market_regime(mr)
     st.markdown(
         "<span style='color:#8b949e;font-size:0.85rem;'>"
         "Lihat sektor mana yang paling banyak sinyal BUY — "
@@ -2347,8 +2348,6 @@ elif "Heatmap" in mode:
 # ══════════════════════════════════════════════════════════════
 elif "Screener" in mode:
     st.markdown("## 🚀 Screener Massal")
-    mr = get_market_regime()
-    render_market_regime(mr)
     st.markdown(
         f"<span style='color:#8b949e;font-size:0.85rem;'>"
         f"Filter: Ichimoku Uptrend · {'HA Hijau · ' if require_ha else ''}"
@@ -2650,8 +2649,6 @@ elif "Screener" in mode:
 # ══════════════════════════════════════════════════════════════
 elif "Early Bird" in mode:
     st.markdown("## 🐦 Early Bird Screener")
-    mr = get_market_regime()
-    render_market_regime(mr)
     st.markdown(
         "<span style='color:#8b949e;font-size:0.85rem;'>"
         "Deteksi saham yang **belum** breakout tapi sinyal Ichimoku mulai terbentuk "
@@ -2913,8 +2910,6 @@ Sizing lebih kecil, cutloss lebih ketat.
 elif "RS Hunter" in mode:
     st.markdown("## 💪 RS Hunter — Saham Kuat Saat IHSG Merah")
 
-    mr = get_market_regime()
-    render_market_regime(mr)
 
     st.markdown(
         "<span style='color:#8b949e;font-size:0.85rem;'>"
