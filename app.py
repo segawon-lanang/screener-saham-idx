@@ -1077,24 +1077,33 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
 #   Volume + VWAP            → konfirmasi institusional
 
 WEIGHTS = {
-    "cloud_pos"   : 2.5,   # di atas / dalam / di bawah awan
-    "tk_kj"       : 1.0,   # tenkan > kijun
-    "chikou"      : 0.8,   # chikou bullish
-    "fib_zone"    : 2.5,   # di zona entry / di bawah cutloss
-    "ema_trend"   : 1.2,   # ema20 > ema50
-    "price_ema"   : 0.8,   # harga > ema20
-    "macd"        : 1.5,   # macd hist positif
-    "macd_cross"  : 0.5,   # macd cross up (bonus)
-    "adx"         : 0.5,   # ADX kuat
-    "ha"          : 1.0,   # ha green
-    "ha_seq"      : 0.5,   # ha berturut konsisten
-    "ha_no_tail"  : 0.3,   # momentum penuh
-    "srsi_timing" : 1.0,   # stoch rsi timing
-    "volume"      : 0.8,   # volume konfirmasi
-    "vwap"        : 0.6,   # di atas VWAP
-    "rsi_extreme" : 0.5,   # oversold/overbought
+    # ── Trend primer (bobot terbesar — paling prediktif) ──
+    "cloud_pos"    : 2.5,   # ichimoku cloud position
+    "tk_kj"        : 1.0,   # tenkan > kijun
+    "chikou"       : 0.8,   # chikou konfirmasi
+    "ema_trend"    : 1.2,   # ema20 > ema50
+    "hh_hl"        : 1.5,   # higher high + higher low (market structure)
+    # ── Entry timing ──
+    "fib_zone"     : 2.5,   # di zona entry fibonacci
+    "price_ema"    : 0.8,   # harga > ema20
+    "srsi_timing"  : 1.0,   # stochrsi timing
+    "bb_squeeze"   : 0.8,   # bollinger squeeze → explosive move imminent
+    "bb_breakout"  : 1.0,   # breakout dari upper band
+    # ── Momentum confirmation ──
+    "macd"         : 1.5,   # macd positif
+    "macd_cross"   : 0.5,   # macd cross up
+    "macd_accel"   : 0.7,   # histogram makin besar (momentum accelerating)
+    "adx"          : 0.5,   # adx kuat
+    # ── Candle & volume quality ──
+    "ha"           : 1.0,   # ha green
+    "ha_seq"       : 0.5,   # ha konsisten
+    "ha_no_tail"   : 0.3,   # momentum penuh
+    "volume"       : 0.8,   # volume konfirmasi
+    "multi_accum"  : 1.2,   # multi-day accumulation pattern
+    "vwap"         : 0.6,   # di atas vwap
+    "rsi_extreme"  : 0.5,   # rsi oversold/overbought
 }
-MAX_SCORE = sum(WEIGHTS.values())   # ~16.3
+MAX_SCORE = sum(WEIGHTS.values())   # ~21.5
 
 def build_plan(h: dict) -> TradingSignal:
     score  = 0.0
