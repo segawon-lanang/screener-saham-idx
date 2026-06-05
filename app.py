@@ -239,6 +239,13 @@ class MarketRegime:
     breadth_pct: float   # % saham di atas EMA20 (dari sample)
     warning: str         # pesan ke user
     multiplier: float    # 1.0=normal, 0.7=hati-hati, 0.4=defensif
+    # Data harga IHSG hari ini
+    ihsg_last:  float = 0.0
+    ihsg_open:  float = 0.0
+    ihsg_high:  float = 0.0
+    ihsg_low:   float = 0.0
+    ihsg_chg1d: float = 0.0   # % change vs previous close
+    ihsg_prev:  float = 0.0   # previous close
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_market_regime() -> MarketRegime:
@@ -255,11 +262,19 @@ def get_market_regime() -> MarketRegime:
             df_ihsg.columns = df_ihsg.columns.get_level_values(0)
 
         c = s(df_ihsg["Close"])
+        o = s(df_ihsg["Open"])
+        h_s = s(df_ihsg["High"])
+        l_s = s(df_ihsg["Low"])
         ema20_ihsg = float(EMAIndicator(c, window=20).ema_indicator().iloc[-1])
         ema50_ihsg = float(EMAIndicator(c, window=50).ema_indicator().iloc[-1])
         last       = float(c.iloc[-1])
+        prev_close = float(c.iloc[-2]) if len(c) >= 2 else last
+        chg1d      = (last / prev_close - 1) * 100 if prev_close > 0 else 0.0
         chg5d      = (last / float(c.iloc[-6]) - 1) * 100 if len(c) >= 6 else 0
         chg20d     = (last / float(c.iloc[-21]) - 1) * 100 if len(c) >= 21 else 0
+        open_now   = float(o.iloc[-1])
+        high_now   = float(h_s.iloc[-1])
+        low_now    = float(l_s.iloc[-1])
 
         # Trend IHSG
         if last > ema20_ihsg and ema20_ihsg > ema50_ihsg and chg20d > 2:
@@ -282,6 +297,12 @@ def get_market_regime() -> MarketRegime:
             ihsg_change_5d=round(chg5d,2), ihsg_change_20d=round(chg20d,2),
             breadth_pct=50.0,   # diupdate saat screener jalan
             warning=warn, multiplier=mult,
+            ihsg_last=round(last, 2),
+            ihsg_open=round(open_now, 2),
+            ihsg_high=round(high_now, 2),
+            ihsg_low=round(low_now, 2),
+            ihsg_chg1d=round(chg1d, 2),
+            ihsg_prev=round(prev_close, 2),
         )
     except Exception as e:
         return MarketRegime("NEUTRAL","SIDEWAYS",0,0,50,f"Error IHSG: {e}",1.0)
@@ -301,21 +322,99 @@ def _get_ihsg_cached() -> pd.DataFrame:
 
 def render_market_regime(mr: MarketRegime):
     """Banner IHSG regime — tampil di atas semua mode."""
-    col      = {"BULL": "#00e676", "NEUTRAL": "#ffc107", "BEAR": "#f44336"}.get(mr.regime, "#ffc107")
-    ihsg_col = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
+    col       = {"BULL": "#00e676", "NEUTRAL": "#ffc107", "BEAR": "#f44336"}.get(mr.regime, "#ffc107")
+    chg_col   = "#00e676" if mr.ihsg_chg1d >= 0 else "#f44336"
+    chg5_col  = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
+    chg20_col = "#00e676" if mr.ihsg_change_20d >= 0 else "#f44336"
+    arrow     = "▲" if mr.ihsg_chg1d >= 0 else "▼"
+
+    # Range bar hari ini: posisi close dalam range H-L
+    rng   = mr.ihsg_high - mr.ihsg_low
+    pos   = ((mr.ihsg_last - mr.ihsg_low) / rng * 100) if rng > 0 else 50
+    pos   = max(2, min(98, pos))
+
     st.markdown(f"""
-    <div style="background:#161b22;border:1px solid {col};border-radius:8px;
-                padding:0.6rem 1.2rem;margin-top:0.5rem;margin-bottom:1rem;
-                display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
-      <span style="color:{col};font-weight:700;font-size:0.9rem;">
-        🌐 IHSG: {mr.ihsg_trend} &nbsp;|&nbsp; Regime: {mr.regime}
-      </span>
-      <span style="font-size:0.82rem;color:#8b949e;">
-        5d: <span style="color:{ihsg_col}">{mr.ihsg_change_5d:+.1f}%</span> &nbsp;·&nbsp;
-        20d: {mr.ihsg_change_20d:+.1f}% &nbsp;·&nbsp;
-        Sizing multiplier: {mr.multiplier:.0%}
-      </span>
-      <span style="font-size:0.82rem;color:{col};">{mr.warning}</span>
+    <div style="background:#161b22;border:1px solid {col};border-radius:10px;
+                padding:0.75rem 1.4rem;margin-top:0.5rem;margin-bottom:1rem;">
+
+      <!-- Row 1: Regime badge + IHSG price + change -->
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem 1.5rem;">
+
+        <!-- Kiri: Regime + trend -->
+        <div style="display:flex;align-items:center;gap:0.75rem;">
+          <span style="color:{col};font-weight:700;font-size:0.9rem;
+                       background:{col}18;border:1px solid {col}55;
+                       border-radius:6px;padding:2px 10px;white-space:nowrap;">
+            {mr.regime}
+          </span>
+          <span style="color:#8b949e;font-size:0.82rem;">
+            🌐 IHSG &nbsp;·&nbsp; {mr.ihsg_trend}
+          </span>
+        </div>
+
+        <!-- Tengah: Harga + change 1d -->
+        <div style="display:flex;align-items:baseline;gap:0.6rem;">
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:1.5rem;
+                       font-weight:700;color:#e6edf3;">
+            {mr.ihsg_last:,.2f}
+          </span>
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:1rem;
+                       font-weight:600;color:{chg_col};">
+            {arrow} {mr.ihsg_chg1d:+.2f}%
+          </span>
+          <span style="font-size:0.78rem;color:#8b949e;">
+            vs prev {mr.ihsg_prev:,.2f}
+          </span>
+        </div>
+
+        <!-- Kanan: Warning -->
+        <span style="font-size:0.82rem;color:{col};white-space:nowrap;">{mr.warning}</span>
+      </div>
+
+      <!-- Row 2: OHLC + multi-period change + range bar -->
+      <div style="display:flex;align-items:center;flex-wrap:wrap;
+                  gap:0.4rem 1.6rem;margin-top:0.55rem;">
+
+        <!-- OHLC -->
+        <span style="font-size:0.78rem;color:#8b949e;font-family:'IBM Plex Mono',monospace;">
+          O&nbsp;<span style="color:#c9d1d9;">{mr.ihsg_open:,.2f}</span>
+          &nbsp;H&nbsp;<span style="color:#00e676;">{mr.ihsg_high:,.2f}</span>
+          &nbsp;L&nbsp;<span style="color:#f44336;">{mr.ihsg_low:,.2f}</span>
+        </span>
+
+        <!-- Divider -->
+        <span style="color:#30363d;">|</span>
+
+        <!-- Multi-period change -->
+        <span style="font-size:0.78rem;color:#8b949e;">
+          5d:&nbsp;<span style="color:{chg5_col};font-weight:600;">{mr.ihsg_change_5d:+.2f}%</span>
+          &nbsp;&nbsp;20d:&nbsp;<span style="color:{chg20_col};font-weight:600;">{mr.ihsg_change_20d:+.2f}%</span>
+        </span>
+
+        <!-- Divider -->
+        <span style="color:#30363d;">|</span>
+
+        <!-- Sizing multiplier -->
+        <span style="font-size:0.78rem;color:#8b949e;">
+          Sizing:&nbsp;<span style="color:{col};font-weight:600;">{mr.multiplier:.0%}</span>
+        </span>
+
+        <!-- Day range bar -->
+        <div style="flex:1;min-width:160px;max-width:300px;">
+          <div style="display:flex;justify-content:space-between;
+                      font-size:0.68rem;color:#8b949e;margin-bottom:2px;
+                      font-family:'IBM Plex Mono',monospace;">
+            <span>L {mr.ihsg_low:,.0f}</span>
+            <span style="color:#8b949e;">Day Range</span>
+            <span>H {mr.ihsg_high:,.0f}</span>
+          </div>
+          <div style="background:#21262d;border-radius:4px;height:6px;position:relative;">
+            <div style="position:absolute;left:{pos}%;transform:translateX(-50%);
+                        width:10px;height:6px;border-radius:3px;background:{chg_col};"></div>
+          </div>
+        </div>
+
+      </div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1949,8 +2048,11 @@ def build_sector_heatmap(hasil: list[dict]) -> go.Figure:
 # ══════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("## 📡 IFH Pro")
-    st.markdown(f"<span style='color:#8b949e;font-size:0.78rem;'>{len(daftar_saham)} emiten loaded</span>",
-                unsafe_allow_html=True)
+    st.markdown(
+        f"<span style='color:#8b949e;font-size:0.78rem;'>"
+        f"v4.1 &nbsp;·&nbsp; {len(daftar_saham)} emiten loaded</span>",
+        unsafe_allow_html=True,
+    )
     st.divider()
 
     mode = st.radio("Mode", [
@@ -1962,24 +2064,84 @@ with st.sidebar:
     ], label_visibility="collapsed")
     st.divider()
 
-    days = st.slider("Lookback Fibonacci (hari)", 30, 365, 120, 10)
+    days        = st.slider("Lookback Fibonacci (hari)", 30, 365, 120, 10)
     require_ha  = st.toggle("Filter HA Hijau", value=True)
     min_vol_rel = st.slider("Min. Volume Relatif ×ADV20", 0.0, 3.0, 0.5, 0.1)
     min_conf    = st.slider("Min. Confidence (%)", 0, 100, 50, 5)
     st.divider()
     st.markdown("**🏥 Liquidity Filter**")
-    use_health    = st.toggle("Aktifkan filter likuiditas", value=True)
-    min_price     = st.number_input("Min. harga (Rp)", value=50, step=10)
-    min_adv_juta  = st.number_input("Min. ADV value (Rp juta/hari)", value=500, step=100)
-    workers     = st.slider("Parallel workers (screener)", 2, 16, 8, 2,
-                             help="Thread paralel untuk download. Lebih tinggi = lebih cepat.")
+    use_health   = st.toggle("Aktifkan filter likuiditas", value=True)
+    min_price    = st.number_input("Min. harga (Rp)", value=50, step=10)
+    min_adv_juta = st.number_input("Min. ADV value (Rp juta/hari)", value=500, step=100)
+    workers      = st.slider("Parallel workers (screener)", 2, 16, 8, 2,
+                              help="Thread paralel untuk download. Lebih tinggi = lebih cepat.")
     st.divider()
 
-    st.caption(f"{'🟢 scipy' if HAS_SCIPY else '🟡 fallback pivot'}")
-    st.caption("Ichimoku · EMA · MACD · ADX · StochRSI")
-    st.caption("ATR · VWAP · OBV · CQS · Heikin Ashi")
-    st.caption("Fibonacci · Early Bird · Dist. Trap")
-    st.caption("Sector Heatmap · Sentiment AI · RS Hunter")
+    # ── IHSG mini status di sidebar ──
+    _mr_sb = get_market_regime()
+    _col_sb = {"BULL": "#00e676", "NEUTRAL": "#ffc107", "BEAR": "#f44336"}.get(_mr_sb.regime, "#ffc107")
+    _cc_sb  = "#00e676" if _mr_sb.ihsg_chg1d >= 0 else "#f44336"
+    _arrow  = "▲" if _mr_sb.ihsg_chg1d >= 0 else "▼"
+    st.markdown(f"""
+    <div style="background:#0d1117;border:1px solid {_col_sb}44;border-radius:8px;
+                padding:0.55rem 0.8rem;margin-bottom:0.6rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-size:0.72rem;color:#8b949e;">🌐 IHSG</span>
+        <span style="font-size:0.7rem;background:{_col_sb}22;color:{_col_sb};
+                     border-radius:4px;padding:1px 7px;font-weight:700;">{_mr_sb.regime}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:4px;">
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:1.05rem;
+                     font-weight:700;color:#e6edf3;">{_mr_sb.ihsg_last:,.2f}</span>
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:0.82rem;
+                     font-weight:600;color:{_cc_sb};">{_arrow} {_mr_sb.ihsg_chg1d:+.2f}%</span>
+      </div>
+      <div style="font-size:0.68rem;color:#8b949e;margin-top:3px;
+                  font-family:'IBM Plex Mono',monospace;">
+        H&nbsp;<span style="color:#00e676;">{_mr_sb.ihsg_high:,.2f}</span>
+        &nbsp;L&nbsp;<span style="color:#f44336;">{_mr_sb.ihsg_low:,.2f}</span>
+        &nbsp;·&nbsp;5d&nbsp;<span style="color:{'#00e676' if _mr_sb.ihsg_change_5d>=0 else '#f44336'};">{_mr_sb.ihsg_change_5d:+.1f}%</span>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Indikator badge list ──
+    _scipy_badge = (
+        "<span style='background:#1b4332;color:#6ee7b7;border:1px solid #059669;"
+        "border-radius:4px;padding:1px 7px;font-size:0.68rem;'>scipy ✓</span>"
+        if HAS_SCIPY else
+        "<span style='background:#312107;color:#fcd34d;border:1px solid #d97706;"
+        "border-radius:4px;padding:1px 7px;font-size:0.68rem;'>scipy ✗ fallback</span>"
+    )
+    _indicators = [
+        ("📈 Trend",    ["Ichimoku", "EMA 20/50", "ADX", "MACD"]),
+        ("⏱️ Timing",   ["StochRSI", "Heikin Ashi", "OBV"]),
+        ("📐 Fibo",     ["Adaptive Lookback", "Swing H/L", "Entry Zone"]),
+        ("📊 Volume",   ["VWAP", "CQS", "Dist. Trap", "Accum."]),
+        ("🔍 Screener", ["Early Bird", "RS Hunter", "Heatmap"]),
+        ("🤖 AI",       ["Sentiment", "Web Search"]),
+    ]
+    badges_html = ""
+    for group, items in _indicators:
+        pills = " ".join(
+            f"<span style='background:#161b22;color:#8b949e;border:1px solid #30363d;"
+            f"border-radius:3px;padding:1px 5px;font-size:0.65rem;white-space:nowrap;'>{i}</span>"
+            for i in items
+        )
+        badges_html += (
+            f"<div style='margin-bottom:5px;'>"
+            f"<span style='font-size:0.68rem;color:#6e7681;'>{group}</span><br>"
+            f"<div style='display:flex;flex-wrap:wrap;gap:3px;margin-top:3px;'>{pills}</div>"
+            f"</div>"
+        )
+
+    st.markdown(f"""
+    <div style="background:#0d1117;border:1px solid #21262d;border-radius:8px;
+                padding:0.6rem 0.8rem;font-family:'IBM Plex Mono',monospace;">
+      <div style="margin-bottom:6px;">{_scipy_badge}</div>
+      {badges_html}
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════
