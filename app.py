@@ -849,6 +849,68 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
     obv_ema20 = obv.ewm(span=20, adjust=False).mean()
     obv_bull  = float(obv_ema5.iloc[-1]) > float(obv_ema20.iloc[-1])   # OBV trend naik
 
+    # ── Bollinger Band Squeeze (volatility contraction → explosive move imminent) ──
+    bb_mid   = close.rolling(20).mean()
+    bb_std   = close.rolling(20).std()
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+    bb_width     = float((bb_upper - bb_lower).iloc[-1]) / float(bb_mid.iloc[-1]) * 100
+    bb_width_avg = float((bb_upper - bb_lower).rolling(50).mean().iloc[-1]) / float(bb_mid.iloc[-1]) * 100
+    bb_squeeze   = bb_width < bb_width_avg * 0.75        # bandwidth < 75% dari rata-rata → squeeze
+    bb_price_pos = float(close.iloc[-1]) / float(bb_mid.iloc[-1])  # > 1 = di atas mid = bullish
+    bb_breakout_up = (float(close.iloc[-1]) > float(bb_upper.iloc[-2])  # close tembus upper band
+                      and float(close.iloc[-2]) <= float(bb_upper.iloc[-2]))
+
+    # ── Higher High / Higher Low (market structure) ──
+    # Cek 3 swing high dan 3 swing low terakhir dalam window 60 hari
+    _hi60 = s(df["High"]).tail(60).values
+    _lo60 = s(df["Low"]).tail(60).values
+    _cl60 = s(df["Close"]).tail(60).values
+    # Cari pivot high/low dengan window 5
+    _pw = 5
+    _ph_idx = [i for i in range(_pw, len(_hi60) - _pw)
+               if _hi60[i] == max(_hi60[i - _pw: i + _pw + 1])]
+    _pl_idx = [i for i in range(_pw, len(_lo60) - _pw)
+               if _lo60[i] == min(_lo60[i - _pw: i + _pw + 1])]
+    hh_hl = False   # Higher High + Higher Low (bullish structure)
+    lh_ll = False   # Lower High + Lower Low (bearish structure)
+    if len(_ph_idx) >= 2 and len(_pl_idx) >= 2:
+        hh = _hi60[_ph_idx[-1]] > _hi60[_ph_idx[-2]]
+        hl = _lo60[_pl_idx[-1]] > _lo60[_pl_idx[-2]]
+        lh = _hi60[_ph_idx[-1]] < _hi60[_ph_idx[-2]]
+        ll = _lo60[_pl_idx[-1]] < _lo60[_pl_idx[-2]]
+        hh_hl = hh and hl
+        lh_ll = lh and ll
+
+    # ── MACD Histogram Slope (accelerating vs decelerating momentum) ──
+    macd_series   = s(macd_obj.macd_diff())
+    macd_slope    = float(macd_series.iloc[-1]) - float(macd_series.iloc[-3])  # slope 3 bar
+    macd_accel    = macd_slope > 0 and macd_hist > 0   # positif & makin kuat
+    macd_decel    = macd_slope < 0 and macd_hist > 0   # positif tapi melemah
+    macd_neg_accel = macd_slope < 0 and macd_hist < 0  # negatif & makin lemah
+
+    # ── Multi-day Accumulation Pattern ──
+    # Smart money masuk bertahap: 3+ dari 5 hari terakhir volume di atas ADV + close > open
+    _v5   = volume.iloc[-5:].values
+    _c5   = close.iloc[-5:].values
+    _o5   = s(df["Open"]).iloc[-5:].values
+    _adv5 = float(volume.iloc[-26:-1].mean())
+    accum_days = int(sum(1 for i in range(5)
+                         if _v5[i] > _adv5 * 1.1 and _c5[i] > _o5[i]))
+    multi_day_accum = accum_days >= 3   # ≥3 dari 5 hari = pola akumulasi kuat
+
+    # ── Bear Market Rally Detector ──
+    # Saham yang RS kuat + volume spike + oversold = kandidat terbang saat IHSG rebound
+    rsi_deep_oversold = rsi_now < 40
+    vol_surge_3d      = float(volume.iloc[-3:].mean()) > _adv5 * 1.5 if _adv5 > 0 else False
+    bear_rally_candidate = (
+        rs_score >= 55
+        and rsi_deep_oversold
+        and vol_surge_3d
+        and not dist_trap
+        and cqs > 0.45
+    )
+
     # ── Early Bird signals (Ichimoku pre-breakout) ──
     # Senkou A dan B 26 bar ke depan (future cloud)
     sa_series = s(ichi.ichimoku_a())
@@ -993,6 +1055,12 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
         rs_score=rs_score,
         # adaptive
         adaptive_days=adaptive_days,
+        # v5 additions
+        bb_squeeze=bb_squeeze, bb_breakout_up=bb_breakout_up, bb_price_pos=bb_price_pos, bb_width=bb_width,
+        hh_hl=hh_hl, lh_ll=lh_ll,
+        macd_slope=macd_slope, macd_accel=macd_accel, macd_decel=macd_decel, macd_neg_accel=macd_neg_accel,
+        multi_day_accum=multi_day_accum, accum_days=accum_days,
+        bear_rally_candidate=bear_rally_candidate,
     )
 
 
