@@ -63,7 +63,7 @@ html, body, [data-testid="stAppViewContainer"] {
     border-right: 1px solid #21262d !important;
 }
 [data-testid="stSidebar"] * { color: #c9d1d9 !important; }
-.block-container { padding: 2.5rem 2rem 1rem !important; max-width: 1400px; }
+.block-container { padding: 1rem 2rem !important; max-width: 1400px; }
 
 /* ── Typography ── */
 h1,h2,h3 { font-family:'IBM Plex Sans',sans-serif !important; }
@@ -183,20 +183,13 @@ def s(x) -> pd.Series:
 
 
 def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
-    O, H, L, C = s(df["Open"]), s(df["High"]), s(df["Low"]), s(df["Close"])
-    hac = (O + H + L + C) / 4
-    # Vectorized HA Open via cumulative approach:
-    # hao[i] = (hao[i-1] + hac[i-1]) / 2  →  EWM with alpha=0.5, adjust=False
-    hao_init = float((O.iloc[0] + C.iloc[0]) / 2)
-    hac_arr  = hac.values
-    hao      = np.empty(len(df))
-    hao[0]   = hao_init
-    # Numba-free tight loop is still O(n) but avoids pandas overhead per element
+    O,H,L,C = s(df["Open"]), s(df["High"]), s(df["Low"]), s(df["Close"])
+    hac = (O+H+L+C)/4
+    hao = np.empty(len(df)); hao[0] = (O.iloc[0]+C.iloc[0])/2
     for i in range(1, len(df)):
-        hao[i] = (hao[i - 1] + hac_arr[i - 1]) * 0.5
+        hao[i] = (hao[i-1] + hac.iloc[i-1]) / 2
     r = df.copy()
-    r["HA_C"] = hac.values
-    r["HA_O"] = hao
+    r["HA_C"] = hac.values; r["HA_O"] = hao
     r["HA_H"] = np.maximum(H.values, np.maximum(hao, hac.values))
     r["HA_L"] = np.minimum(L.values, np.minimum(hao, hac.values))
     return r
@@ -239,13 +232,6 @@ class MarketRegime:
     breadth_pct: float   # % saham di atas EMA20 (dari sample)
     warning: str         # pesan ke user
     multiplier: float    # 1.0=normal, 0.7=hati-hati, 0.4=defensif
-    # Data harga IHSG hari ini
-    ihsg_last:  float = 0.0
-    ihsg_open:  float = 0.0
-    ihsg_high:  float = 0.0
-    ihsg_low:   float = 0.0
-    ihsg_chg1d: float = 0.0   # % change vs previous close
-    ihsg_prev:  float = 0.0   # previous close
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_market_regime() -> MarketRegime:
@@ -262,19 +248,11 @@ def get_market_regime() -> MarketRegime:
             df_ihsg.columns = df_ihsg.columns.get_level_values(0)
 
         c = s(df_ihsg["Close"])
-        o = s(df_ihsg["Open"])
-        h_s = s(df_ihsg["High"])
-        l_s = s(df_ihsg["Low"])
         ema20_ihsg = float(EMAIndicator(c, window=20).ema_indicator().iloc[-1])
         ema50_ihsg = float(EMAIndicator(c, window=50).ema_indicator().iloc[-1])
         last       = float(c.iloc[-1])
-        prev_close = float(c.iloc[-2]) if len(c) >= 2 else last
-        chg1d      = (last / prev_close - 1) * 100 if prev_close > 0 else 0.0
         chg5d      = (last / float(c.iloc[-6]) - 1) * 100 if len(c) >= 6 else 0
         chg20d     = (last / float(c.iloc[-21]) - 1) * 100 if len(c) >= 21 else 0
-        open_now   = float(o.iloc[-1])
-        high_now   = float(h_s.iloc[-1])
-        low_now    = float(l_s.iloc[-1])
 
         # Trend IHSG
         if last > ema20_ihsg and ema20_ihsg > ema50_ihsg and chg20d > 2:
@@ -297,12 +275,6 @@ def get_market_regime() -> MarketRegime:
             ihsg_change_5d=round(chg5d,2), ihsg_change_20d=round(chg20d,2),
             breadth_pct=50.0,   # diupdate saat screener jalan
             warning=warn, multiplier=mult,
-            ihsg_last=round(last, 2),
-            ihsg_open=round(open_now, 2),
-            ihsg_high=round(high_now, 2),
-            ihsg_low=round(low_now, 2),
-            ihsg_chg1d=round(chg1d, 2),
-            ihsg_prev=round(prev_close, 2),
         )
     except Exception as e:
         return MarketRegime("NEUTRAL","SIDEWAYS",0,0,50,f"Error IHSG: {e}",1.0)
@@ -322,99 +294,39 @@ def _get_ihsg_cached() -> pd.DataFrame:
 
 def render_market_regime(mr: MarketRegime):
     """Banner IHSG regime — tampil di atas semua mode."""
-    col       = {"BULL": "#00e676", "NEUTRAL": "#ffc107", "BEAR": "#f44336"}.get(mr.regime, "#ffc107")
-    chg_col   = "#00e676" if mr.ihsg_chg1d >= 0 else "#f44336"
-    chg5_col  = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
-    chg20_col = "#00e676" if mr.ihsg_change_20d >= 0 else "#f44336"
-    arrow     = "▲" if mr.ihsg_chg1d >= 0 else "▼"
-
-    # Range bar hari ini: posisi close dalam range H-L
-    rng   = mr.ihsg_high - mr.ihsg_low
-    pos   = ((mr.ihsg_last - mr.ihsg_low) / rng * 100) if rng > 0 else 50
-    pos   = max(2, min(98, pos))
-
+    col  = {"BULL":"#00e676","NEUTRAL":"#ffc107","BEAR":"#f44336"}.get(mr.regime,"#ffc107")
+    ihsg_col = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
     st.markdown(f"""
-    <div style="background:#161b22;border:1px solid {col};border-radius:10px;
-                padding:0.75rem 1.4rem;margin-top:0.5rem;margin-bottom:1rem;">
-
-      <!-- Row 1: Regime badge + IHSG price + change -->
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem 1.5rem;">
-
-        <!-- Kiri: Regime + trend -->
-        <div style="display:flex;align-items:center;gap:0.75rem;">
-          <span style="color:{col};font-weight:700;font-size:0.9rem;
-                       background:{col}18;border:1px solid {col}55;
-                       border-radius:6px;padding:2px 10px;white-space:nowrap;">
-            {mr.regime}
-          </span>
-          <span style="color:#8b949e;font-size:0.82rem;">
-            🌐 IHSG &nbsp;·&nbsp; {mr.ihsg_trend}
-          </span>
-        </div>
-
-        <!-- Tengah: Harga + change 1d -->
-        <div style="display:flex;align-items:baseline;gap:0.6rem;">
-          <span style="font-family:'IBM Plex Mono',monospace;font-size:1.5rem;
-                       font-weight:700;color:#e6edf3;">
-            {mr.ihsg_last:,.2f}
-          </span>
-          <span style="font-family:'IBM Plex Mono',monospace;font-size:1rem;
-                       font-weight:600;color:{chg_col};">
-            {arrow} {mr.ihsg_chg1d:+.2f}%
-          </span>
-          <span style="font-size:0.78rem;color:#8b949e;">
-            vs prev {mr.ihsg_prev:,.2f}
-          </span>
-        </div>
-
-        <!-- Kanan: Warning -->
-        <span style="font-size:0.82rem;color:{col};white-space:nowrap;">{mr.warning}</span>
-      </div>
-
-      <!-- Row 2: OHLC + multi-period change + range bar -->
-      <div style="display:flex;align-items:center;flex-wrap:wrap;
-                  gap:0.4rem 1.6rem;margin-top:0.55rem;">
-
-        <!-- OHLC -->
-        <span style="font-size:0.78rem;color:#8b949e;font-family:'IBM Plex Mono',monospace;">
-          O&nbsp;<span style="color:#c9d1d9;">{mr.ihsg_open:,.2f}</span>
-          &nbsp;H&nbsp;<span style="color:#00e676;">{mr.ihsg_high:,.2f}</span>
-          &nbsp;L&nbsp;<span style="color:#f44336;">{mr.ihsg_low:,.2f}</span>
-        </span>
-
-        <!-- Divider -->
-        <span style="color:#30363d;">|</span>
-
-        <!-- Multi-period change -->
-        <span style="font-size:0.78rem;color:#8b949e;">
-          5d:&nbsp;<span style="color:{chg5_col};font-weight:600;">{mr.ihsg_change_5d:+.2f}%</span>
-          &nbsp;&nbsp;20d:&nbsp;<span style="color:{chg20_col};font-weight:600;">{mr.ihsg_change_20d:+.2f}%</span>
-        </span>
-
-        <!-- Divider -->
-        <span style="color:#30363d;">|</span>
-
-        <!-- Sizing multiplier -->
-        <span style="font-size:0.78rem;color:#8b949e;">
-          Sizing:&nbsp;<span style="color:{col};font-weight:600;">{mr.multiplier:.0%}</span>
-        </span>
-
-        <!-- Day range bar -->
-        <div style="flex:1;min-width:160px;max-width:300px;">
-          <div style="display:flex;justify-content:space-between;
-                      font-size:0.68rem;color:#8b949e;margin-bottom:2px;
-                      font-family:'IBM Plex Mono',monospace;">
-            <span>L {mr.ihsg_low:,.0f}</span>
-            <span style="color:#8b949e;">Day Range</span>
-            <span>H {mr.ihsg_high:,.0f}</span>
-          </div>
-          <div style="background:#21262d;border-radius:4px;height:6px;position:relative;">
-            <div style="position:absolute;left:{pos}%;transform:translateX(-50%);
-                        width:10px;height:6px;border-radius:3px;background:{chg_col};"></div>
-          </div>
-        </div>
-
-      </div>
+    <div style="background:#161b22;border:1px solid {col};border-radius:8px;
+                padding:0.6rem 1.2rem;margin-bottom:1rem;
+                display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
+      <span style="color:{col};font-weight:700;font-size:0.9rem;">
+        🌐 IHSG: {mr.ihsg_trend} &nbsp;|&nbsp; Regime: {mr.regime}
+      </span>
+      <span style="font-size:0.82rem;color:#8b949e;">
+        5d: <span style="color:{ihsg_col}">{mr.ihsg_change_5d:+.1f}%</span> &nbsp;·&nbsp;
+        20d: {mr.ihsg_change_20d:+.1f}% &nbsp;·&nbsp;
+        Sizing multiplier: {mr.multiplier:.0%}
+      </span>
+      <span style="font-size:0.82rem;color:{col};">{mr.warning}</span>
+    </div>
+    """, unsafe_allow_html=True)
+    """Banner kecil di atas halaman — konteks market saat ini."""
+    col = {"BULL":"#00e676","NEUTRAL":"#ffc107","BEAR":"#f44336"}.get(mr.regime,"#ffc107")
+    ihsg_col = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
+    st.markdown(f"""
+    <div style="background:#161b22;border:1px solid {col};border-radius:8px;
+                padding:0.6rem 1.2rem;margin-bottom:1rem;
+                display:flex;align-items:center;justify-content:space-between;">
+      <span style="color:{col};font-weight:700;font-size:0.9rem;">
+        🌐 IHSG: {mr.ihsg_trend} &nbsp;|&nbsp; Regime: {mr.regime}
+      </span>
+      <span style="font-size:0.82rem;color:#8b949e;">
+        5d: <span style="color:{ihsg_col}">{mr.ihsg_change_5d:+.1f}%</span> &nbsp;·&nbsp;
+        20d: {mr.ihsg_change_20d:+.1f}% &nbsp;·&nbsp;
+        Sizing multiplier: {mr.multiplier:.0%}
+      </span>
+      <span style="font-size:0.82rem;color:{col};">{mr.warning}</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -699,7 +611,7 @@ def download_one(ticker: str) -> pd.DataFrame:
 @st.cache_data(ttl=60, show_spinner=False)
 def live_price(ticker: str, fallback: float) -> float:
     try:    return float(yf.Ticker(ticker).fast_info["last_price"])
-    except Exception: return fallback
+    except: return fallback
 
 
 def download_batch_parallel(tickers: list[str], max_workers: int = 8) -> dict[str, pd.DataFrame]:
@@ -709,10 +621,8 @@ def download_batch_parallel(tickers: list[str], max_workers: int = 8) -> dict[st
         fut = {ex.submit(download_one, t): t for t in tickers}
         for f in concurrent.futures.as_completed(fut):
             t = fut[f]
-            try:
-                result[t] = f.result()
-            except Exception:
-                result[t] = pd.DataFrame()
+            try:    result[t] = f.result()
+            except: result[t] = pd.DataFrame()
     return result
 
 
@@ -848,68 +758,6 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
     obv_ema5  = obv.ewm(span=5,  adjust=False).mean()
     obv_ema20 = obv.ewm(span=20, adjust=False).mean()
     obv_bull  = float(obv_ema5.iloc[-1]) > float(obv_ema20.iloc[-1])   # OBV trend naik
-
-    # ── Bollinger Band Squeeze (volatility contraction → explosive move imminent) ──
-    bb_mid   = close.rolling(20).mean()
-    bb_std   = close.rolling(20).std()
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-    bb_width     = float((bb_upper - bb_lower).iloc[-1]) / float(bb_mid.iloc[-1]) * 100
-    bb_width_avg = float((bb_upper - bb_lower).rolling(50).mean().iloc[-1]) / float(bb_mid.iloc[-1]) * 100
-    bb_squeeze   = bb_width < bb_width_avg * 0.75        # bandwidth < 75% dari rata-rata → squeeze
-    bb_price_pos = float(close.iloc[-1]) / float(bb_mid.iloc[-1])  # > 1 = di atas mid = bullish
-    bb_breakout_up = (float(close.iloc[-1]) > float(bb_upper.iloc[-2])  # close tembus upper band
-                      and float(close.iloc[-2]) <= float(bb_upper.iloc[-2]))
-
-    # ── Higher High / Higher Low (market structure) ──
-    # Cek 3 swing high dan 3 swing low terakhir dalam window 60 hari
-    _hi60 = s(df["High"]).tail(60).values
-    _lo60 = s(df["Low"]).tail(60).values
-    _cl60 = s(df["Close"]).tail(60).values
-    # Cari pivot high/low dengan window 5
-    _pw = 5
-    _ph_idx = [i for i in range(_pw, len(_hi60) - _pw)
-               if _hi60[i] == max(_hi60[i - _pw: i + _pw + 1])]
-    _pl_idx = [i for i in range(_pw, len(_lo60) - _pw)
-               if _lo60[i] == min(_lo60[i - _pw: i + _pw + 1])]
-    hh_hl = False   # Higher High + Higher Low (bullish structure)
-    lh_ll = False   # Lower High + Lower Low (bearish structure)
-    if len(_ph_idx) >= 2 and len(_pl_idx) >= 2:
-        hh = _hi60[_ph_idx[-1]] > _hi60[_ph_idx[-2]]
-        hl = _lo60[_pl_idx[-1]] > _lo60[_pl_idx[-2]]
-        lh = _hi60[_ph_idx[-1]] < _hi60[_ph_idx[-2]]
-        ll = _lo60[_pl_idx[-1]] < _lo60[_pl_idx[-2]]
-        hh_hl = hh and hl
-        lh_ll = lh and ll
-
-    # ── MACD Histogram Slope (accelerating vs decelerating momentum) ──
-    macd_series   = s(macd_obj.macd_diff())
-    macd_slope    = float(macd_series.iloc[-1]) - float(macd_series.iloc[-3])  # slope 3 bar
-    macd_accel    = macd_slope > 0 and macd_hist > 0   # positif & makin kuat
-    macd_decel    = macd_slope < 0 and macd_hist > 0   # positif tapi melemah
-    macd_neg_accel = macd_slope < 0 and macd_hist < 0  # negatif & makin lemah
-
-    # ── Multi-day Accumulation Pattern ──
-    # Smart money masuk bertahap: 3+ dari 5 hari terakhir volume di atas ADV + close > open
-    _v5   = volume.iloc[-5:].values
-    _c5   = close.iloc[-5:].values
-    _o5   = s(df["Open"]).iloc[-5:].values
-    _adv5 = float(volume.iloc[-26:-1].mean())
-    accum_days = int(sum(1 for i in range(5)
-                         if _v5[i] > _adv5 * 1.1 and _c5[i] > _o5[i]))
-    multi_day_accum = accum_days >= 3   # ≥3 dari 5 hari = pola akumulasi kuat
-
-    # ── Bear Market Rally Detector ──
-    # Saham yang RS kuat + volume spike + oversold = kandidat terbang saat IHSG rebound
-    rsi_deep_oversold = rsi_now < 40
-    vol_surge_3d      = float(volume.iloc[-3:].mean()) > _adv5 * 1.5 if _adv5 > 0 else False
-    bear_rally_candidate = (
-        rs_score >= 55
-        and rsi_deep_oversold
-        and vol_surge_3d
-        and not dist_trap
-        and cqs > 0.45
-    )
 
     # ── Early Bird signals (Ichimoku pre-breakout) ──
     # Senkou A dan B 26 bar ke depan (future cloud)
@@ -1055,12 +903,6 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
         rs_score=rs_score,
         # adaptive
         adaptive_days=adaptive_days,
-        # v5 additions
-        bb_squeeze=bb_squeeze, bb_breakout_up=bb_breakout_up, bb_price_pos=bb_price_pos, bb_width=bb_width,
-        hh_hl=hh_hl, lh_ll=lh_ll,
-        macd_slope=macd_slope, macd_accel=macd_accel, macd_decel=macd_decel, macd_neg_accel=macd_neg_accel,
-        multi_day_accum=multi_day_accum, accum_days=accum_days,
-        bear_rally_candidate=bear_rally_candidate,
     )
 
 
@@ -1077,49 +919,30 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
 #   Volume + VWAP            → konfirmasi institusional
 
 WEIGHTS = {
-    # ── Trend primer (bobot terbesar — paling prediktif) ──
-    "cloud_pos"    : 2.5,   # ichimoku cloud position
-    "tk_kj"        : 1.0,   # tenkan > kijun
-    "chikou"       : 0.8,   # chikou konfirmasi
-    "ema_trend"    : 1.2,   # ema20 > ema50
-    "hh_hl"        : 1.5,   # higher high + higher low (market structure)
-    # ── Entry timing ──
-    "fib_zone"     : 2.5,   # di zona entry fibonacci
-    "price_ema"    : 0.8,   # harga > ema20
-    "srsi_timing"  : 1.0,   # stochrsi timing
-    "bb_squeeze"   : 0.8,   # bollinger squeeze → explosive move imminent
-    "bb_breakout"  : 1.0,   # breakout dari upper band
-    # ── Momentum confirmation ──
-    "macd"         : 1.5,   # macd positif
-    "macd_cross"   : 0.5,   # macd cross up
-    "macd_accel"   : 0.7,   # histogram makin besar (momentum accelerating)
-    "adx"          : 0.5,   # adx kuat
-    # ── Candle & volume quality ──
-    "ha"           : 1.0,   # ha green
-    "ha_seq"       : 0.5,   # ha konsisten
-    "ha_no_tail"   : 0.3,   # momentum penuh
-    "volume"       : 0.8,   # volume konfirmasi
-    "multi_accum"  : 1.2,   # multi-day accumulation pattern
-    "vwap"         : 0.6,   # di atas vwap
-    "rsi_extreme"  : 0.5,   # rsi oversold/overbought
+    "cloud_pos"   : 2.5,   # di atas / dalam / di bawah awan
+    "tk_kj"       : 1.0,   # tenkan > kijun
+    "chikou"      : 0.8,   # chikou bullish
+    "fib_zone"    : 2.5,   # di zona entry / di bawah cutloss
+    "ema_trend"   : 1.2,   # ema20 > ema50
+    "price_ema"   : 0.8,   # harga > ema20
+    "macd"        : 1.5,   # macd hist positif
+    "macd_cross"  : 0.5,   # macd cross up (bonus)
+    "adx"         : 0.5,   # ADX kuat
+    "ha"          : 1.0,   # ha green
+    "ha_seq"      : 0.5,   # ha berturut konsisten
+    "ha_no_tail"  : 0.3,   # momentum penuh
+    "srsi_timing" : 1.0,   # stoch rsi timing
+    "volume"      : 0.8,   # volume konfirmasi
+    "vwap"        : 0.6,   # di atas VWAP
+    "rsi_extreme" : 0.5,   # oversold/overbought
 }
-MAX_SCORE = sum(WEIGHTS.values())   # ~21.5
+MAX_SCORE = sum(WEIGHTS.values())   # ~16.3
 
 def build_plan(h: dict) -> TradingSignal:
     score  = 0.0
     alasan : list[str] = []
     aksi   : list[str] = []
     lvl    = h["lvl"]
-    p      = h["harga"]
-
-    # ═══════════════════════════════════════════════════
-    # CONFLUENCE GATE — indikator primer wajib terpenuhi
-    # Sinyal BUY tidak bisa muncul jika cloud + EMA + structure semuanya bearish
-    # ═══════════════════════════════════════════════════
-    _cloud_ok    = h["di_atas"] or h["di_dalam"]
-    _ema_ok      = h["ema_bull"] or h["price_ema20"]
-    _structure_ok = h["hh_hl"] or h["tk_kj"]
-    hard_bearish = (not _cloud_ok) and (not _ema_ok) and (not _structure_ok)
 
     # ── A. Ichimoku cloud ──
     if h["di_atas"]:
@@ -1146,17 +969,7 @@ def build_plan(h: dict) -> TradingSignal:
         score -= WEIGHTS["chikou"] * 0.5
         alasan.append("⚠️ Chikou belum konfirmasi")
 
-    # ── B. Market Structure (HH/HL) ──
-    if h.get("hh_hl"):
-        score += WEIGHTS["hh_hl"]
-        alasan.append("📈 Higher High + Higher Low — struktur uptrend terkonfirmasi")
-    elif h.get("lh_ll"):
-        score -= WEIGHTS["hh_hl"]
-        alasan.append("📉 Lower High + Lower Low — struktur downtrend, hindari entry baru")
-    else:
-        alasan.append("➡️ Struktur harga sideways — belum ada trend jelas")
-
-    # ── C. Fibonacci zone ──
+    # ── B. Fibonacci zone ──
     if h["in_entry"]:
         score += WEIGHTS["fib_zone"]
         alasan.append("🎯 Harga di ZONA ENTRY Fibo (38.2%–50%) — sweet spot!")
@@ -1172,7 +985,7 @@ def build_plan(h: dict) -> TradingSignal:
     else:
         alasan.append(f"📍 Harga di luar zona entry (entry: {lvl['entry_bawah']:,.0f}–{lvl['entry_atas']:,.0f})")
 
-    # ── D. EMA trend ──
+    # ── C. EMA trend ──
     if h["ema_bull"]:
         score += WEIGHTS["ema_trend"]
         alasan.append(f"✅ EMA20 ({h['ema20']:,.0f}) > EMA50 ({h['ema50']:,.0f}) — uptrend struktural")
@@ -1187,49 +1000,25 @@ def build_plan(h: dict) -> TradingSignal:
         score -= WEIGHTS["price_ema"] * 0.5
         alasan.append("⚠️ Harga di bawah EMA20")
 
-    # ── E. MACD + slope ──
+    # ── D. MACD ──
     if h["macd_cross_up"]:
         score += WEIGHTS["macd"] + WEIGHTS["macd_cross"]
         alasan.append(f"🚀 MACD baru cross UP — sinyal momentum kuat! (hist:{h['macd_hist']:+.2f})")
     elif h["macd_bull"]:
         score += WEIGHTS["macd"]
-        if h.get("macd_accel"):
-            score += WEIGHTS["macd_accel"]
-            alasan.append(f"🚀 MACD histogram positif & ACCELERATING (slope:{h.get('macd_slope',0):+.4f}) — momentum makin kuat!")
-        elif h.get("macd_decel"):
-            alasan.append(f"⚠️ MACD positif tapi MELAMBAT — momentum mulai melemah (hist:{h['macd_hist']:+.2f})")
-        else:
-            alasan.append(f"✅ MACD histogram positif ({h['macd_hist']:+.2f}) — momentum bullish")
+        alasan.append(f"✅ MACD histogram positif ({h['macd_hist']:+.2f}) — momentum bullish")
     else:
         score -= WEIGHTS["macd"]
-        if h.get("macd_neg_accel"):
-            score -= WEIGHTS["macd_accel"] * 0.5
-            alasan.append(f"❌ MACD negatif & makin lemah — selling pressure intensif ({h['macd_hist']:+.2f})")
-        else:
-            alasan.append(f"❌ MACD histogram negatif ({h['macd_hist']:+.2f}) — momentum bearish")
+        alasan.append(f"❌ MACD histogram negatif ({h['macd_hist']:+.2f}) — momentum bearish")
 
-    # ── F. ADX ──
+    # ── E. ADX trend strength ──
     if h["adx_strong"]:
         score += WEIGHTS["adx"]
         alasan.append(f"💪 ADX {h['adx']:.1f} — trend kuat (>25)")
     else:
         alasan.append(f"➡️ ADX {h['adx']:.1f} — trend lemah/sideways (<25)")
 
-    # ── G. Bollinger Band Squeeze ──
-    if h.get("bb_breakout_up"):
-        score += WEIGHTS["bb_breakout"]
-        alasan.append(f"💥 BB Breakout UP! Harga tembus upper band — momentum eksplosif!")
-    elif h.get("bb_squeeze"):
-        score += WEIGHTS["bb_squeeze"]
-        alasan.append(f"🔥 Bollinger Band Squeeze (width {h.get('bb_width',0):.1f}%) — volatilitas terkompresi, breakout imminent!")
-    else:
-        bb_pos = h.get("bb_price_pos", 1.0)
-        if bb_pos > 1.02:
-            alasan.append(f"📊 Harga di upper BB zone ({bb_pos:.2f}× mid) — bullish tapi waspadai overbought")
-        elif bb_pos < 0.98:
-            alasan.append(f"📊 Harga di lower BB zone ({bb_pos:.2f}× mid) — area potensial reversal")
-
-    # ── H. Heikin Ashi ──
+    # ── F. Heikin Ashi ──
     if h["ha_green"]:
         score += WEIGHTS["ha"]
         if h["ha_seq"] >= 5:
@@ -1248,7 +1037,7 @@ def build_plan(h: dict) -> TradingSignal:
         else:
             alasan.append(f"🔴 HA merah {h['ha_seq']} candle")
 
-    # ── I. Stochastic RSI ──
+    # ── G. Stochastic RSI (timing presisi) ──
     if h["srsi_cross_up"]:
         score += WEIGHTS["srsi_timing"]
         alasan.append(f"⏱️ StochRSI cross up di area rendah (K:{h['srsi_k']:.0f}) — timing entry bagus")
@@ -1261,7 +1050,7 @@ def build_plan(h: dict) -> TradingSignal:
     else:
         alasan.append(f"📊 StochRSI netral (K:{h['srsi_k']:.0f} D:{h['srsi_d']:.0f})")
 
-    # ── J. Volume & VWAP ──
+    # ── H. Volume & VWAP ──
     if h["accum_confirm"]:
         score += WEIGHTS["volume"] * 1.5
         alasan.append(f"🏦 Volume spike {h['vol_rel']:.1f}× + CQS {h['cqs']:.2f} — GENUINE AKUMULASI smart money!")
@@ -1276,14 +1065,6 @@ def build_plan(h: dict) -> TradingSignal:
         alasan.append(f"📉 Volume sepi {h['vol_rel']:.1f}×ADV20 — lemah keyakinan")
     else:
         alasan.append(f"📊 Volume {h['vol_rel']:.1f}×ADV20 — normal")
-
-    # Multi-day accumulation
-    if h.get("multi_day_accum"):
-        score += WEIGHTS["multi_accum"]
-        alasan.append(f"🏦 Akumulasi multi-hari: {h.get('accum_days',0)}/5 hari bullish volume — smart money masuk bertahap!")
-    elif h.get("accum_days", 0) >= 2:
-        score += WEIGHTS["multi_accum"] * 0.4
-        alasan.append(f"📊 {h.get('accum_days',0)}/5 hari akumulasi — pola mulai terbentuk")
 
     if h["shooting_star"]:
         score -= 1.0
@@ -1303,7 +1084,7 @@ def build_plan(h: dict) -> TradingSignal:
         score -= WEIGHTS["vwap"] * 0.5
         alasan.append(f"⚠️ Di bawah VWAP ({h['vwap']:,.0f})")
 
-    # RSI
+    # ── RSI extreme ──
     if h["rsi"] < 30:
         score += WEIGHTS["rsi_extreme"]
         alasan.append(f"💧 RSI oversold ({h['rsi']:.0f}) — area murah historis")
@@ -1313,8 +1094,10 @@ def build_plan(h: dict) -> TradingSignal:
     else:
         alasan.append(f"📈 RSI {h['rsi']:.0f} — normal range")
 
-    # ── K. Relative Strength vs IHSG ──
+    # ── I. Relative Strength vs IHSG (bonus/penalty) ──
+    # RS score tidak masuk MAX_SCORE — dihitung sebagai bonus modifier
     rs_bonus = 0.0
+    rs_score = h.get("rs_score", 0)
     rs_5d    = h.get("rs_5d", 0)
     rs_20d   = h.get("rs_20d", 0)
     beta     = h.get("beta_60", 1.0)
@@ -1333,7 +1116,7 @@ def build_plan(h: dict) -> TradingSignal:
 
     if beta < 0.5:
         rs_bonus += 0.5
-        alasan.append(f"🛡️ Beta rendah ({beta:.2f}) — defensif, tidak terseret IHSG")
+        alasan.append(f"🛡️ Beta rendah ({beta:.2f}) — tidak mudah terseret jatuh saat IHSG turun")
     elif beta > 1.5:
         rs_bonus -= 0.3
         alasan.append(f"⚡ Beta tinggi ({beta:.2f}) — amplify gerakan IHSG (dua arah)")
@@ -1348,16 +1131,11 @@ def build_plan(h: dict) -> TradingSignal:
 
     score += rs_bonus
 
-    # ═══════════════════════════════════════════════════
-    # NORMALIZE + SINYAL
-    # ═══════════════════════════════════════════════════
+    # ── Normalize score ke 0-100 ──
     confidence = int(min(100, max(0, (score / MAX_SCORE) * 100 + 50)))
-    norm       = score / MAX_SCORE   # roughly -1 to +1
 
-    # Hard bearish gate: kalau 3 indikator primer semuanya merah → max WAIT
-    if hard_bearish and norm >= 0.10:
-        norm = 0.09   # paksa ke batas atas WAIT
-
+    # ── Sinyal ──
+    norm = score / MAX_SCORE   # -1 to +1
     if norm >= 0.55:
         sinyal, css = "STRONG BUY",  "STRONG-BUY";  sizing = 100
     elif norm >= 0.30:
@@ -1372,85 +1150,60 @@ def build_plan(h: dict) -> TradingSignal:
         sinyal, css = "STRONG SELL", "STRONG-SELL";  sizing = 0
 
     # ── Zona ──
-    if p >= lvl["target_2"]:      zona = "Di atas Target 2 (161.8%)"
-    elif p >= lvl["target_1"]:    zona = "Di area Swing High / Target 1"
-    elif p >= lvl["entry_atas"]:  zona = "Antara SH & Entry Atas (23.6%–38.2%)"
-    elif p >= lvl["entry_bawah"]: zona = "🎯 ZONA ENTRY OPTIMAL (38.2%–50%)"
-    elif p >= lvl["cutloss"]:     zona = "Antara Entry Bawah & Cutloss (50%–61.8%)"
-    elif p >= lvl["swing_low"]:   zona = "⛔ Di bawah Cutloss — Bearish"
-    else:                          zona = "💀 Di bawah Swing Low — Sangat Bearish"
+    p = h["harga"]
+    if p >= lvl["target_2"]:    zona = "Di atas Target 2 (161.8%)"
+    elif p >= lvl["target_1"]:  zona = "Di area Swing High / Target 1"
+    elif p >= lvl["entry_atas"]:zona = "Antara SH & Entry Atas (23.6%–38.2%)"
+    elif p >= lvl["entry_bawah"]:zona = "🎯 ZONA ENTRY OPTIMAL (38.2%–50%)"
+    elif p >= lvl["cutloss"]:   zona = "Antara Entry Bawah & Cutloss (50%–61.8%)"
+    elif p >= lvl["swing_low"]: zona = "⛔ Di bawah Cutloss — Bearish"
+    else:                        zona = "💀 Di bawah Swing Low — Sangat Bearish"
 
-    # ── ATR-based sizing label ──
+    # ── ATR-based sizing ──
     atr_pct = h["atr_pct"]
     if atr_pct < 1.5:    atr_label = f"Volatilitas Rendah ({atr_pct:.1f}% ATR) → bisa full sizing"
     elif atr_pct < 3.0:  atr_label = f"Volatilitas Sedang ({atr_pct:.1f}% ATR) → sizing 50-75%"
     else:                atr_label = f"Volatilitas Tinggi ({atr_pct:.1f}% ATR) → hati-hati, sizing 25-40%"
 
-    # ── R/R ──
+    # ── Action plan — distribution trap override ──
     rr_val = (lvl["target_1"] - p) / max(p - lvl["cutloss"], 1)
 
-    # ── R/R GATE: sinyal BUY wajib punya R/R ≥ 1.5 ──
-    if "BUY" in sinyal and rr_val < 1.5:
-        # Turunkan sinyal satu level
-        if sinyal == "STRONG BUY":
-            sinyal, css, sizing = "BUY", "BUY", 75
-        elif sinyal == "BUY":
-            sinyal, css, sizing = "SPEC. BUY", "SPEC-BUY", 40
-        else:
-            sinyal, css, sizing = "WAIT", "WAIT", 0
-        alasan.append(f"⚠️ R/R {rr_val:.1f}:1 terlalu rendah (min 1.5:1) — sinyal diturunkan satu level")
-
-    # ═══════════════════════════════════════════════════
-    # ACTION PLAN
-    # ═══════════════════════════════════════════════════
-
-    # Override 1: Distribution trap
+    # Hard override: kalau distribution trap terdeteksi → paksa WAIT/SELL
     if h["dist_trap"] and "BUY" in sinyal:
-        sinyal = "WAIT"; css = "WAIT"; sizing = 0
+        sinyal = "WAIT"
+        css    = "WAIT"
+        sizing = 0
         aksi.append("🚨 DISTRIBUTION TRAP terdeteksi — sinyal BUY DIBATALKAN!")
         aksi.append(f"🔍 Volume {h['vol_rel']:.1f}×ADV tapi CQS {h['cqs']:.2f} — close terlalu dekat LOW")
-        aksi.append("⏳ Tunggu 1–3 hari: entry aman jika CQS > 0.6 pada volume tinggi berikutnya")
-
-    # Override 2: Bear Rally Candidate — khusus saat pasar bearish
-    elif h.get("bear_rally_candidate") and "BUY" in sinyal:
-        alasan.append("🔥 BEAR RALLY CANDIDATE — RS kuat + oversold + volume surge saat pasar merah!")
-        aksi.append("🎯 BEAR RALLY PLAY: Entry agresif karena justru ini yang paling kencang saat IHSG rebound")
-        aksi.append(f"🟢 Entry zona: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
-        aksi.append(f"🛑 CUTLOSS KETAT: daily close < {lvl['cutloss']:,.0f} (jangan toleransi loss besar di bear market)")
-        aksi.append(f"🎯 TARGET KONSERVATIF: {lvl['target_1']:,.0f} (ambil profit di T1, jangan rakus)")
-        aksi.append(f"📐 R/R: 1:{rr_val:.1f}")
-        aksi.append(f"💰 {atr_label}")
-
+        aksi.append("⏳ Tunggu 1–3 hari konfirmasi: apakah harga lanjut naik atau turun")
+        aksi.append(f"❗ Aman entry hanya jika CQS > 0.6 pada volume tinggi berikutnya")
     elif h["shooting_star"] and "BUY" in sinyal:
-        aksi.append("⚠️ Ada pola shooting star — sizing lebih kecil, tunggu konfirmasi")
+        aksi.append("⚠️ Ada pola shooting star — pertimbangkan sizing lebih kecil atau tunggu konfirmasi")
         aksi.append(f"🛑 CUTLOSS diperketat: jika close < {lvl['cutloss']:,.0f}")
-        aksi.append(f"🟡 Entry sizing 50% saja: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
-        aksi.append(f"🎯 TARGET 1: {lvl['target_1']:,.0f}   TARGET 2: {lvl['target_2']:,.0f}")
-        aksi.append(f"📐 R/R saat ini ≈ 1:{rr_val:.1f}")
-
-    elif "BUY" in sinyal:
-        if h["accum_confirm"] or h.get("multi_day_accum"):
-            aksi.append("🏦 Akumulasi institusional terkonfirmasi — sinyal lebih kuat dari biasa!")
-        if h.get("bb_squeeze"):
-            aksi.append("🔥 BB Squeeze aktif — posisikan sebelum breakout untuk R/R terbaik!")
         if h["in_entry"]:
-            aksi.append(f"🟢 ENTRY sekarang — harga {p:,.0f} di zona sweet spot")
+            aksi.append(f"🟡 Entry dengan sizing 50% saja, sisanya tunggu hari berikutnya")
+        else:
+            aksi.append(f"⏳ TUNGGU harga masuk zona entry: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
+        aksi.append(f"🎯 TARGET 1: {lvl['target_1']:,.0f}   TARGET 2: {lvl['target_2']:,.0f}")
+        aksi.append(f"📐 R/R saat ini ≈ 1 : {rr_val:.1f}")
+    elif "BUY" in sinyal:
+        if h["accum_confirm"]:
+            aksi.append("🏦 Akumulasi institusional terkonfirmasi — sinyal lebih kuat dari biasa!")
+        if h["in_entry"]:
+            aksi.append(f"🟢 ENTRY sekarang — harga {p:,.0f} ada di zona sweet spot")
         else:
             aksi.append(f"⏳ TUNGGU pullback ke zona entry: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
         aksi.append(f"🛑 CUTLOSS jika daily close < {lvl['cutloss']:,.0f}")
         aksi.append(f"🎯 TARGET 1: {lvl['target_1']:,.0f}   TARGET 2: {lvl['target_2']:,.0f}")
-        aksi.append(f"📐 R/R saat ini ≈ 1:{rr_val:.1f}")
+        aksi.append(f"📐 R/R saat ini ≈ 1 : {rr_val:.1f}")
         aksi.append(f"💰 {atr_label}")
         if sizing:
             aksi.append(f"🎲 Sizing saran: {sizing}% dari alokasi posisi")
-
     elif "WAIT" in sinyal:
         if not h["dist_trap"]:
-            aksi.append("⏳ WAIT — konfluensi belum cukup kuat")
+            aksi.append(f"⏳ WAIT — konfluensi belum cukup kuat")
             aksi.append(f"👁️ Set alert di zona entry: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
-            aksi.append("👁️ Tunggu: MACD cross up + HA hijau + CQS > 0.6 + volume konfirmasi")
-            if h.get("bb_squeeze"):
-                aksi.append("🔥 BB Squeeze terdeteksi — pantau ketat, breakout bisa terjadi tiba-tiba!")
+            aksi.append("👁️ Tunggu MACD cross up + HA hijau + CQS > 0.6 sebagai konfirmasi")
     else:
         aksi.append("🔴 JANGAN masuk posisi baru — sinyal bearish dominan")
         aksi.append("📤 Jika pegang: pertimbangkan REDUCE atau EXIT bertahap")
@@ -1727,8 +1480,8 @@ def build_chart(ticker: str, h: dict, df: pd.DataFrame, candle_type: str = "Cand
                   row=1, col=1)
 
     # ── Volume bars ──
-    is_green    = close.values >= open_s.values
-    vol_colors  = np.where(is_green, CT["green"], CT["red"]).tolist()
+    vol_colors = [CT["green"] if float(close.iloc[i]) >= float(open_s.iloc[i])
+                  else CT["red"] for i in range(len(dates))]
     fig.add_trace(go.Bar(
         x=dates, y=vol_s,
         marker_color=vol_colors, marker_opacity=0.6,
@@ -1781,15 +1534,17 @@ def build_volume_profile(df: pd.DataFrame, h: dict, bins: int = 40) -> go.Figure
     low_s  = s(df["Low"])
     vol_s  = s(df["Volume"])
 
-    # Distribusi volume ke price bucket — vectorized via np.digitize
+    # Distribusi volume ke price bucket (pakai typical price per candle)
     typical  = (high_s + low_s + close) / 3
     price_min, price_max = float(typical.min()), float(typical.max())
-    bin_edges   = np.linspace(price_min, price_max, bins + 1)
+    bin_edges = np.linspace(price_min, price_max, bins + 1)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
-    # np.digitize returns 1-based indices; clip to [0, bins-1]
-    indices     = np.clip(np.digitize(typical.values, bin_edges) - 1, 0, bins - 1)
-    vol_per_bin = np.bincount(indices, weights=vol_s.values, minlength=bins)
+    vol_per_bin = np.zeros(bins)
+    for i in range(len(typical)):
+        idx = min(int((float(typical.iloc[i]) - price_min) /
+                      (price_max - price_min + 1e-9) * bins), bins - 1)
+        vol_per_bin[idx] += float(vol_s.iloc[i])
 
     # POC
     poc_idx = int(np.argmax(vol_per_bin))
@@ -1819,14 +1574,13 @@ def build_volume_profile(df: pd.DataFrame, h: dict, bins: int = 40) -> go.Figure
     vah = bin_centers[va_hi_idx]
     val = bin_centers[va_lo_idx]
 
-    # ── Warna per bar: vectorized ──
-    bar_colors = np.where(
-        np.arange(bins) == poc_idx, "#ffd600",
-        np.where(
-            (bin_centers >= val) & (bin_centers <= vah), "rgba(100,181,246,0.7)",
-            np.where(bin_centers > vah, "rgba(0,230,118,0.55)", "rgba(239,83,80,0.55)")
-        )
-    ).tolist()
+    # ── Warna per bar: merah di bawah VAL, hijau di atas VAH, abu di VA, kuning di POC ──
+    bar_colors = []
+    for i, bc in enumerate(bin_centers):
+        if i == poc_idx:                bar_colors.append("#ffd600")
+        elif bc >= val and bc <= vah:   bar_colors.append("rgba(100,181,246,0.7)")
+        elif bc > vah:                  bar_colors.append("rgba(0,230,118,0.55)")
+        else:                           bar_colors.append("rgba(239,83,80,0.55)")
 
     fig = go.Figure()
 
@@ -2027,24 +1781,19 @@ Kalau tidak ada berita relevan, score=0, label=NEUTRAL, ringkasan="Tidak ada ber
             return resp
 
         import urllib.request
-        api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
         body = json.dumps({
             "model": "claude-sonnet-4-20250514",
-            "max_tokens": 600,
+            "max_tokens": 500,
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [{"role": "user", "content": prompt}]
         }).encode()
         req = urllib.request.Request(
             "https://api.anthropic.com/v1/messages",
             data=body,
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-            },
+            headers={"Content-Type": "application/json"},
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=25) as r:
+        with urllib.request.urlopen(req, timeout=20) as r:
             data = json.loads(r.read())
 
         # Ambil text dari response
@@ -2205,11 +1954,8 @@ def build_sector_heatmap(hasil: list[dict]) -> go.Figure:
 # ══════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("## 📡 IFH Pro")
-    st.markdown(
-        f"<span style='color:#8b949e;font-size:0.78rem;'>"
-        f"v4.1 &nbsp;·&nbsp; {len(daftar_saham)} emiten loaded</span>",
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"<span style='color:#8b949e;font-size:0.78rem;'>{len(daftar_saham)} emiten loaded</span>",
+                unsafe_allow_html=True)
     st.divider()
 
     mode = st.radio("Mode", [
@@ -2221,84 +1967,24 @@ with st.sidebar:
     ], label_visibility="collapsed")
     st.divider()
 
-    days        = st.slider("Lookback Fibonacci (hari)", 30, 365, 120, 10)
+    days = st.slider("Lookback Fibonacci (hari)", 30, 365, 120, 10)
     require_ha  = st.toggle("Filter HA Hijau", value=True)
     min_vol_rel = st.slider("Min. Volume Relatif ×ADV20", 0.0, 3.0, 0.5, 0.1)
     min_conf    = st.slider("Min. Confidence (%)", 0, 100, 50, 5)
     st.divider()
     st.markdown("**🏥 Liquidity Filter**")
-    use_health   = st.toggle("Aktifkan filter likuiditas", value=True)
-    min_price    = st.number_input("Min. harga (Rp)", value=50, step=10)
-    min_adv_juta = st.number_input("Min. ADV value (Rp juta/hari)", value=500, step=100)
-    workers      = st.slider("Parallel workers (screener)", 2, 16, 8, 2,
-                              help="Thread paralel untuk download. Lebih tinggi = lebih cepat.")
+    use_health    = st.toggle("Aktifkan filter likuiditas", value=True)
+    min_price     = st.number_input("Min. harga (Rp)", value=50, step=10)
+    min_adv_juta  = st.number_input("Min. ADV value (Rp juta/hari)", value=500, step=100)
+    workers     = st.slider("Parallel workers (screener)", 2, 16, 8, 2,
+                             help="Thread paralel untuk download. Lebih tinggi = lebih cepat.")
     st.divider()
 
-    # ── IHSG mini status di sidebar ──
-    _mr_sb = get_market_regime()
-    _col_sb = {"BULL": "#00e676", "NEUTRAL": "#ffc107", "BEAR": "#f44336"}.get(_mr_sb.regime, "#ffc107")
-    _cc_sb  = "#00e676" if _mr_sb.ihsg_chg1d >= 0 else "#f44336"
-    _arrow  = "▲" if _mr_sb.ihsg_chg1d >= 0 else "▼"
-    st.markdown(f"""
-    <div style="background:#0d1117;border:1px solid {_col_sb}44;border-radius:8px;
-                padding:0.55rem 0.8rem;margin-bottom:0.6rem;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-size:0.72rem;color:#8b949e;">🌐 IHSG</span>
-        <span style="font-size:0.7rem;background:{_col_sb}22;color:{_col_sb};
-                     border-radius:4px;padding:1px 7px;font-weight:700;">{_mr_sb.regime}</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:4px;">
-        <span style="font-family:'IBM Plex Mono',monospace;font-size:1.05rem;
-                     font-weight:700;color:#e6edf3;">{_mr_sb.ihsg_last:,.2f}</span>
-        <span style="font-family:'IBM Plex Mono',monospace;font-size:0.82rem;
-                     font-weight:600;color:{_cc_sb};">{_arrow} {_mr_sb.ihsg_chg1d:+.2f}%</span>
-      </div>
-      <div style="font-size:0.68rem;color:#8b949e;margin-top:3px;
-                  font-family:'IBM Plex Mono',monospace;">
-        H&nbsp;<span style="color:#00e676;">{_mr_sb.ihsg_high:,.2f}</span>
-        &nbsp;L&nbsp;<span style="color:#f44336;">{_mr_sb.ihsg_low:,.2f}</span>
-        &nbsp;·&nbsp;5d&nbsp;<span style="color:{'#00e676' if _mr_sb.ihsg_change_5d>=0 else '#f44336'};">{_mr_sb.ihsg_change_5d:+.1f}%</span>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Indikator badge list ──
-    _scipy_badge = (
-        "<span style='background:#1b4332;color:#6ee7b7;border:1px solid #059669;"
-        "border-radius:4px;padding:1px 7px;font-size:0.68rem;'>scipy ✓</span>"
-        if HAS_SCIPY else
-        "<span style='background:#312107;color:#fcd34d;border:1px solid #d97706;"
-        "border-radius:4px;padding:1px 7px;font-size:0.68rem;'>scipy ✗ fallback</span>"
-    )
-    _indicators = [
-        ("📈 Trend",    ["Ichimoku", "EMA 20/50", "ADX", "MACD"]),
-        ("⏱️ Timing",   ["StochRSI", "Heikin Ashi", "OBV"]),
-        ("📐 Fibo",     ["Adaptive Lookback", "Swing H/L", "Entry Zone"]),
-        ("📊 Volume",   ["VWAP", "CQS", "Dist. Trap", "Accum."]),
-        ("🔍 Screener", ["Early Bird", "RS Hunter", "Heatmap"]),
-        ("🤖 AI",       ["Sentiment", "Web Search"]),
-    ]
-    badges_html = ""
-    for group, items in _indicators:
-        pills = " ".join(
-            f"<span style='background:#161b22;color:#8b949e;border:1px solid #30363d;"
-            f"border-radius:3px;padding:1px 5px;font-size:0.65rem;white-space:nowrap;'>{i}</span>"
-            for i in items
-        )
-        badges_html += (
-            f"<div style='margin-bottom:5px;'>"
-            f"<span style='font-size:0.68rem;color:#6e7681;'>{group}</span><br>"
-            f"<div style='display:flex;flex-wrap:wrap;gap:3px;margin-top:3px;'>{pills}</div>"
-            f"</div>"
-        )
-
-    st.markdown(f"""
-    <div style="background:#0d1117;border:1px solid #21262d;border-radius:8px;
-                padding:0.6rem 0.8rem;font-family:'IBM Plex Mono',monospace;">
-      <div style="margin-bottom:6px;">{_scipy_badge}</div>
-      {badges_html}
-    </div>
-    """, unsafe_allow_html=True)
+    st.caption(f"{'🟢 scipy' if HAS_SCIPY else '🟡 fallback pivot'}")
+    st.caption("Ichimoku · EMA · MACD · ADX · StochRSI")
+    st.caption("ATR · VWAP · OBV · CQS · Heikin Ashi")
+    st.caption("Fibonacci · Early Bird · Dist. Trap")
+    st.caption("Sector Heatmap · Sentiment AI · RS Hunter")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2522,50 +2208,31 @@ elif "Heatmap" in mode:
             for f in concurrent.futures.as_completed(fut):
                 t = fut[f]
                 try:    data_map_hm[t] = f.result()
-                except Exception: data_map_hm[t] = pd.DataFrame()
+                except: data_map_hm[t] = pd.DataFrame()
                 done += 1
                 pbar.progress(done/total/2, text=f"⚡ Download: {done}/{total}")
 
-        # Analisis semua — PARALLEL (heatmap butuh semua sinyal)
-        def _hm_worker(ticker: str) -> Optional[tuple]:
+        # Analisis semua (tanpa filter ketat — heatmap butuh semua sinyal)
+        for i, ticker in enumerate(daftar_saham):
             df_t = data_map_hm.get(ticker, pd.DataFrame())
-            if df_t is None or df_t.empty:
-                return None
+            if df_t is None or df_t.empty: continue
             try:
                 if use_health:
                     hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
-                    if not hc.lolos:
-                        return None
+                    if not hc.lolos: continue
                 h = analyse(ticker, days, df=df_t, mr=mr)
-                if not h:
-                    return None
+                if not h: continue
                 sig = build_plan(h)
                 sig = apply_regime_to_plan(sig, mr)
                 sektor = get_sektor(ticker)
-                return (ticker, h, sig, sektor)
-            except Exception:
-                return None
-
-        hm_done = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            hm_futs = {ex.submit(_hm_worker, t): t for t in daftar_saham}
-            for fut in concurrent.futures.as_completed(hm_futs):
-                hm_done += 1
-                pbar.progress(0.5 + hm_done / total / 2,
-                              text=f"🧠 Analisis: {hm_done}/{total}")
-                try:
-                    result = fut.result()
-                except Exception:
-                    continue
-                if result is None:
-                    continue
-                ticker_r, h, sig, sektor = result
                 st.session_state.heatmap_hasil.append({
-                    "Ticker": ticker_r, "Sektor": sektor,
+                    "Ticker": ticker, "Sektor": sektor,
                     "Sinyal": sig.sinyal, "Conf.": sig.confidence,
                     "Harga": int(round(h["harga"])),
                 })
-                st.session_state.heatmap_raw[ticker_r] = (h, sig)
+                st.session_state.heatmap_raw[ticker] = (h, sig)
+            except: pass
+            pbar.progress(0.5 + (i+1)/total/2, text=f"🧠 Analisis: {i+1}/{total}")
 
         elapsed = time.time() - t0
         pbar.progress(1.0, text=f"✅ Selesai {elapsed:.1f}s")
@@ -2725,7 +2392,7 @@ elif "Screener" in mode:
             for f in concurrent.futures.as_completed(fut):
                 t = fut[f]
                 try:    data_map[t] = f.result()
-                except Exception: data_map[t] = pd.DataFrame()
+                except: data_map[t] = pd.DataFrame()
                 done += 1
                 pbar.progress(done / total / 2, text=f"⚡ Download: {done}/{total}")
 
@@ -2740,7 +2407,7 @@ elif "Screener" in mode:
         for tk, df_tk in data_map.items():
             if df_tk is not None and not df_tk.empty:
                 try: price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
-                except Exception: pass
+                except: pass
 
         def _analyse_worker(ticker: str) -> Optional[tuple]:
             """Jalankan full pipeline satu ticker — dipanggil dari thread pool."""
@@ -3044,7 +2711,7 @@ Sizing lebih kecil, cutloss lebih ketat.
             for f in concurrent.futures.as_completed(fut):
                 t = fut[f]
                 try:    data_map_eb[t] = f.result()
-                except Exception: data_map_eb[t] = pd.DataFrame()
+                except: data_map_eb[t] = pd.DataFrame()
                 done += 1
                 pbar.progress(done / total / 2, text=f"⚡ Download: {done}/{total}")
 
@@ -3056,7 +2723,7 @@ Sizing lebih kecil, cutloss lebih ketat.
         for tk, df_tk in data_map_eb.items():
             if df_tk is not None and not df_tk.empty:
                 try: eb_price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
-                except Exception: pass
+                except: pass
 
         def _eb_worker(ticker: str) -> Optional[tuple]:
             df_t = data_map_eb.get(ticker)
@@ -3102,7 +2769,7 @@ Sizing lebih kecil, cutloss lebih ketat.
                 )
                 try:
                     result = fut.result()
-                except Exception: continue
+                except: continue
                 if result is None: continue
 
                 ticker_r, h, sig = result
@@ -3297,7 +2964,7 @@ elif "RS Hunter" in mode:
             for f in concurrent.futures.as_completed(fut):
                 t = fut[f]
                 try:    data_map_rs[t] = f.result()
-                except Exception: data_map_rs[t] = pd.DataFrame()
+                except: data_map_rs[t] = pd.DataFrame()
                 done += 1
                 pbar.progress(done/total/2, text=f"⚡ Download: {done}/{total}")
 
@@ -3306,7 +2973,7 @@ elif "RS Hunter" in mode:
         for tk, df_tk in data_map_rs.items():
             if df_tk is not None and not df_tk.empty:
                 try: rs_price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
-                except Exception: pass
+                except: pass
 
         # Fase 2: RS scoring paralel
         status.markdown("💪 RS scoring paralel…")
@@ -3347,7 +3014,7 @@ elif "RS Hunter" in mode:
                               text=f"💪 {rs_done}/{rs_valid} — {len(st.session_state.rs_hasil)} RS kuat")
                 try:
                     result = fut.result()
-                except Exception: continue
+                except: continue
                 if result is None: continue
 
                 ticker_r, h, sig = result
