@@ -63,7 +63,7 @@ html, body, [data-testid="stAppViewContainer"] {
     border-right: 1px solid #21262d !important;
 }
 [data-testid="stSidebar"] * { color: #c9d1d9 !important; }
-.block-container { padding: 1rem 2rem !important; max-width: 1400px; }
+.block-container { padding: 2.5rem 2rem 1rem !important; max-width: 1400px; }
 
 /* ── Typography ── */
 h1,h2,h3 { font-family:'IBM Plex Sans',sans-serif !important; }
@@ -305,7 +305,7 @@ def render_market_regime(mr: MarketRegime):
     ihsg_col = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
     st.markdown(f"""
     <div style="background:#161b22;border:1px solid {col};border-radius:8px;
-                padding:0.6rem 1.2rem;margin-bottom:1rem;
+                padding:0.6rem 1.2rem;margin-top:0.5rem;margin-bottom:1rem;
                 display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
       <span style="color:{col};font-weight:700;font-size:0.9rem;">
         🌐 IHSG: {mr.ihsg_trend} &nbsp;|&nbsp; Regime: {mr.regime}
