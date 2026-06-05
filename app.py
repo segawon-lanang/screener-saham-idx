@@ -1110,6 +1110,16 @@ def build_plan(h: dict) -> TradingSignal:
     alasan : list[str] = []
     aksi   : list[str] = []
     lvl    = h["lvl"]
+    p      = h["harga"]
+
+    # ═══════════════════════════════════════════════════
+    # CONFLUENCE GATE — indikator primer wajib terpenuhi
+    # Sinyal BUY tidak bisa muncul jika cloud + EMA + structure semuanya bearish
+    # ═══════════════════════════════════════════════════
+    _cloud_ok    = h["di_atas"] or h["di_dalam"]
+    _ema_ok      = h["ema_bull"] or h["price_ema20"]
+    _structure_ok = h["hh_hl"] or h["tk_kj"]
+    hard_bearish = (not _cloud_ok) and (not _ema_ok) and (not _structure_ok)
 
     # ── A. Ichimoku cloud ──
     if h["di_atas"]:
@@ -1136,7 +1146,17 @@ def build_plan(h: dict) -> TradingSignal:
         score -= WEIGHTS["chikou"] * 0.5
         alasan.append("⚠️ Chikou belum konfirmasi")
 
-    # ── B. Fibonacci zone ──
+    # ── B. Market Structure (HH/HL) ──
+    if h.get("hh_hl"):
+        score += WEIGHTS["hh_hl"]
+        alasan.append("📈 Higher High + Higher Low — struktur uptrend terkonfirmasi")
+    elif h.get("lh_ll"):
+        score -= WEIGHTS["hh_hl"]
+        alasan.append("📉 Lower High + Lower Low — struktur downtrend, hindari entry baru")
+    else:
+        alasan.append("➡️ Struktur harga sideways — belum ada trend jelas")
+
+    # ── C. Fibonacci zone ──
     if h["in_entry"]:
         score += WEIGHTS["fib_zone"]
         alasan.append("🎯 Harga di ZONA ENTRY Fibo (38.2%–50%) — sweet spot!")
@@ -1152,7 +1172,7 @@ def build_plan(h: dict) -> TradingSignal:
     else:
         alasan.append(f"📍 Harga di luar zona entry (entry: {lvl['entry_bawah']:,.0f}–{lvl['entry_atas']:,.0f})")
 
-    # ── C. EMA trend ──
+    # ── D. EMA trend ──
     if h["ema_bull"]:
         score += WEIGHTS["ema_trend"]
         alasan.append(f"✅ EMA20 ({h['ema20']:,.0f}) > EMA50 ({h['ema50']:,.0f}) — uptrend struktural")
@@ -1167,25 +1187,49 @@ def build_plan(h: dict) -> TradingSignal:
         score -= WEIGHTS["price_ema"] * 0.5
         alasan.append("⚠️ Harga di bawah EMA20")
 
-    # ── D. MACD ──
+    # ── E. MACD + slope ──
     if h["macd_cross_up"]:
         score += WEIGHTS["macd"] + WEIGHTS["macd_cross"]
         alasan.append(f"🚀 MACD baru cross UP — sinyal momentum kuat! (hist:{h['macd_hist']:+.2f})")
     elif h["macd_bull"]:
         score += WEIGHTS["macd"]
-        alasan.append(f"✅ MACD histogram positif ({h['macd_hist']:+.2f}) — momentum bullish")
+        if h.get("macd_accel"):
+            score += WEIGHTS["macd_accel"]
+            alasan.append(f"🚀 MACD histogram positif & ACCELERATING (slope:{h.get('macd_slope',0):+.4f}) — momentum makin kuat!")
+        elif h.get("macd_decel"):
+            alasan.append(f"⚠️ MACD positif tapi MELAMBAT — momentum mulai melemah (hist:{h['macd_hist']:+.2f})")
+        else:
+            alasan.append(f"✅ MACD histogram positif ({h['macd_hist']:+.2f}) — momentum bullish")
     else:
         score -= WEIGHTS["macd"]
-        alasan.append(f"❌ MACD histogram negatif ({h['macd_hist']:+.2f}) — momentum bearish")
+        if h.get("macd_neg_accel"):
+            score -= WEIGHTS["macd_accel"] * 0.5
+            alasan.append(f"❌ MACD negatif & makin lemah — selling pressure intensif ({h['macd_hist']:+.2f})")
+        else:
+            alasan.append(f"❌ MACD histogram negatif ({h['macd_hist']:+.2f}) — momentum bearish")
 
-    # ── E. ADX trend strength ──
+    # ── F. ADX ──
     if h["adx_strong"]:
         score += WEIGHTS["adx"]
         alasan.append(f"💪 ADX {h['adx']:.1f} — trend kuat (>25)")
     else:
         alasan.append(f"➡️ ADX {h['adx']:.1f} — trend lemah/sideways (<25)")
 
-    # ── F. Heikin Ashi ──
+    # ── G. Bollinger Band Squeeze ──
+    if h.get("bb_breakout_up"):
+        score += WEIGHTS["bb_breakout"]
+        alasan.append(f"💥 BB Breakout UP! Harga tembus upper band — momentum eksplosif!")
+    elif h.get("bb_squeeze"):
+        score += WEIGHTS["bb_squeeze"]
+        alasan.append(f"🔥 Bollinger Band Squeeze (width {h.get('bb_width',0):.1f}%) — volatilitas terkompresi, breakout imminent!")
+    else:
+        bb_pos = h.get("bb_price_pos", 1.0)
+        if bb_pos > 1.02:
+            alasan.append(f"📊 Harga di upper BB zone ({bb_pos:.2f}× mid) — bullish tapi waspadai overbought")
+        elif bb_pos < 0.98:
+            alasan.append(f"📊 Harga di lower BB zone ({bb_pos:.2f}× mid) — area potensial reversal")
+
+    # ── H. Heikin Ashi ──
     if h["ha_green"]:
         score += WEIGHTS["ha"]
         if h["ha_seq"] >= 5:
@@ -1204,7 +1248,7 @@ def build_plan(h: dict) -> TradingSignal:
         else:
             alasan.append(f"🔴 HA merah {h['ha_seq']} candle")
 
-    # ── G. Stochastic RSI (timing presisi) ──
+    # ── I. Stochastic RSI ──
     if h["srsi_cross_up"]:
         score += WEIGHTS["srsi_timing"]
         alasan.append(f"⏱️ StochRSI cross up di area rendah (K:{h['srsi_k']:.0f}) — timing entry bagus")
@@ -1217,7 +1261,7 @@ def build_plan(h: dict) -> TradingSignal:
     else:
         alasan.append(f"📊 StochRSI netral (K:{h['srsi_k']:.0f} D:{h['srsi_d']:.0f})")
 
-    # ── H. Volume & VWAP ──
+    # ── J. Volume & VWAP ──
     if h["accum_confirm"]:
         score += WEIGHTS["volume"] * 1.5
         alasan.append(f"🏦 Volume spike {h['vol_rel']:.1f}× + CQS {h['cqs']:.2f} — GENUINE AKUMULASI smart money!")
@@ -1232,6 +1276,14 @@ def build_plan(h: dict) -> TradingSignal:
         alasan.append(f"📉 Volume sepi {h['vol_rel']:.1f}×ADV20 — lemah keyakinan")
     else:
         alasan.append(f"📊 Volume {h['vol_rel']:.1f}×ADV20 — normal")
+
+    # Multi-day accumulation
+    if h.get("multi_day_accum"):
+        score += WEIGHTS["multi_accum"]
+        alasan.append(f"🏦 Akumulasi multi-hari: {h.get('accum_days',0)}/5 hari bullish volume — smart money masuk bertahap!")
+    elif h.get("accum_days", 0) >= 2:
+        score += WEIGHTS["multi_accum"] * 0.4
+        alasan.append(f"📊 {h.get('accum_days',0)}/5 hari akumulasi — pola mulai terbentuk")
 
     if h["shooting_star"]:
         score -= 1.0
@@ -1251,7 +1303,7 @@ def build_plan(h: dict) -> TradingSignal:
         score -= WEIGHTS["vwap"] * 0.5
         alasan.append(f"⚠️ Di bawah VWAP ({h['vwap']:,.0f})")
 
-    # ── RSI extreme ──
+    # RSI
     if h["rsi"] < 30:
         score += WEIGHTS["rsi_extreme"]
         alasan.append(f"💧 RSI oversold ({h['rsi']:.0f}) — area murah historis")
@@ -1261,10 +1313,8 @@ def build_plan(h: dict) -> TradingSignal:
     else:
         alasan.append(f"📈 RSI {h['rsi']:.0f} — normal range")
 
-    # ── I. Relative Strength vs IHSG (bonus/penalty) ──
-    # RS score tidak masuk MAX_SCORE — dihitung sebagai bonus modifier
+    # ── K. Relative Strength vs IHSG ──
     rs_bonus = 0.0
-    rs_score = h.get("rs_score", 0)
     rs_5d    = h.get("rs_5d", 0)
     rs_20d   = h.get("rs_20d", 0)
     beta     = h.get("beta_60", 1.0)
@@ -1283,7 +1333,7 @@ def build_plan(h: dict) -> TradingSignal:
 
     if beta < 0.5:
         rs_bonus += 0.5
-        alasan.append(f"🛡️ Beta rendah ({beta:.2f}) — tidak mudah terseret jatuh saat IHSG turun")
+        alasan.append(f"🛡️ Beta rendah ({beta:.2f}) — defensif, tidak terseret IHSG")
     elif beta > 1.5:
         rs_bonus -= 0.3
         alasan.append(f"⚡ Beta tinggi ({beta:.2f}) — amplify gerakan IHSG (dua arah)")
@@ -1298,11 +1348,16 @@ def build_plan(h: dict) -> TradingSignal:
 
     score += rs_bonus
 
-    # ── Normalize score ke 0-100 ──
+    # ═══════════════════════════════════════════════════
+    # NORMALIZE + SINYAL
+    # ═══════════════════════════════════════════════════
     confidence = int(min(100, max(0, (score / MAX_SCORE) * 100 + 50)))
+    norm       = score / MAX_SCORE   # roughly -1 to +1
 
-    # ── Sinyal ──
-    norm = score / MAX_SCORE   # -1 to +1
+    # Hard bearish gate: kalau 3 indikator primer semuanya merah → max WAIT
+    if hard_bearish and norm >= 0.10:
+        norm = 0.09   # paksa ke batas atas WAIT
+
     if norm >= 0.55:
         sinyal, css = "STRONG BUY",  "STRONG-BUY";  sizing = 100
     elif norm >= 0.30:
@@ -1317,60 +1372,85 @@ def build_plan(h: dict) -> TradingSignal:
         sinyal, css = "STRONG SELL", "STRONG-SELL";  sizing = 0
 
     # ── Zona ──
-    p = h["harga"]
-    if p >= lvl["target_2"]:    zona = "Di atas Target 2 (161.8%)"
-    elif p >= lvl["target_1"]:  zona = "Di area Swing High / Target 1"
-    elif p >= lvl["entry_atas"]:zona = "Antara SH & Entry Atas (23.6%–38.2%)"
-    elif p >= lvl["entry_bawah"]:zona = "🎯 ZONA ENTRY OPTIMAL (38.2%–50%)"
-    elif p >= lvl["cutloss"]:   zona = "Antara Entry Bawah & Cutloss (50%–61.8%)"
-    elif p >= lvl["swing_low"]: zona = "⛔ Di bawah Cutloss — Bearish"
-    else:                        zona = "💀 Di bawah Swing Low — Sangat Bearish"
+    if p >= lvl["target_2"]:      zona = "Di atas Target 2 (161.8%)"
+    elif p >= lvl["target_1"]:    zona = "Di area Swing High / Target 1"
+    elif p >= lvl["entry_atas"]:  zona = "Antara SH & Entry Atas (23.6%–38.2%)"
+    elif p >= lvl["entry_bawah"]: zona = "🎯 ZONA ENTRY OPTIMAL (38.2%–50%)"
+    elif p >= lvl["cutloss"]:     zona = "Antara Entry Bawah & Cutloss (50%–61.8%)"
+    elif p >= lvl["swing_low"]:   zona = "⛔ Di bawah Cutloss — Bearish"
+    else:                          zona = "💀 Di bawah Swing Low — Sangat Bearish"
 
-    # ── ATR-based sizing ──
+    # ── ATR-based sizing label ──
     atr_pct = h["atr_pct"]
     if atr_pct < 1.5:    atr_label = f"Volatilitas Rendah ({atr_pct:.1f}% ATR) → bisa full sizing"
     elif atr_pct < 3.0:  atr_label = f"Volatilitas Sedang ({atr_pct:.1f}% ATR) → sizing 50-75%"
     else:                atr_label = f"Volatilitas Tinggi ({atr_pct:.1f}% ATR) → hati-hati, sizing 25-40%"
 
-    # ── Action plan — distribution trap override ──
+    # ── R/R ──
     rr_val = (lvl["target_1"] - p) / max(p - lvl["cutloss"], 1)
 
-    # Hard override: kalau distribution trap terdeteksi → paksa WAIT/SELL
+    # ── R/R GATE: sinyal BUY wajib punya R/R ≥ 1.5 ──
+    if "BUY" in sinyal and rr_val < 1.5:
+        # Turunkan sinyal satu level
+        if sinyal == "STRONG BUY":
+            sinyal, css, sizing = "BUY", "BUY", 75
+        elif sinyal == "BUY":
+            sinyal, css, sizing = "SPEC. BUY", "SPEC-BUY", 40
+        else:
+            sinyal, css, sizing = "WAIT", "WAIT", 0
+        alasan.append(f"⚠️ R/R {rr_val:.1f}:1 terlalu rendah (min 1.5:1) — sinyal diturunkan satu level")
+
+    # ═══════════════════════════════════════════════════
+    # ACTION PLAN
+    # ═══════════════════════════════════════════════════
+
+    # Override 1: Distribution trap
     if h["dist_trap"] and "BUY" in sinyal:
-        sinyal = "WAIT"
-        css    = "WAIT"
-        sizing = 0
+        sinyal = "WAIT"; css = "WAIT"; sizing = 0
         aksi.append("🚨 DISTRIBUTION TRAP terdeteksi — sinyal BUY DIBATALKAN!")
         aksi.append(f"🔍 Volume {h['vol_rel']:.1f}×ADV tapi CQS {h['cqs']:.2f} — close terlalu dekat LOW")
-        aksi.append("⏳ Tunggu 1–3 hari konfirmasi: apakah harga lanjut naik atau turun")
-        aksi.append(f"❗ Aman entry hanya jika CQS > 0.6 pada volume tinggi berikutnya")
+        aksi.append("⏳ Tunggu 1–3 hari: entry aman jika CQS > 0.6 pada volume tinggi berikutnya")
+
+    # Override 2: Bear Rally Candidate — khusus saat pasar bearish
+    elif h.get("bear_rally_candidate") and "BUY" in sinyal:
+        alasan.append("🔥 BEAR RALLY CANDIDATE — RS kuat + oversold + volume surge saat pasar merah!")
+        aksi.append("🎯 BEAR RALLY PLAY: Entry agresif karena justru ini yang paling kencang saat IHSG rebound")
+        aksi.append(f"🟢 Entry zona: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
+        aksi.append(f"🛑 CUTLOSS KETAT: daily close < {lvl['cutloss']:,.0f} (jangan toleransi loss besar di bear market)")
+        aksi.append(f"🎯 TARGET KONSERVATIF: {lvl['target_1']:,.0f} (ambil profit di T1, jangan rakus)")
+        aksi.append(f"📐 R/R: 1:{rr_val:.1f}")
+        aksi.append(f"💰 {atr_label}")
+
     elif h["shooting_star"] and "BUY" in sinyal:
-        aksi.append("⚠️ Ada pola shooting star — pertimbangkan sizing lebih kecil atau tunggu konfirmasi")
+        aksi.append("⚠️ Ada pola shooting star — sizing lebih kecil, tunggu konfirmasi")
         aksi.append(f"🛑 CUTLOSS diperketat: jika close < {lvl['cutloss']:,.0f}")
-        if h["in_entry"]:
-            aksi.append(f"🟡 Entry dengan sizing 50% saja, sisanya tunggu hari berikutnya")
-        else:
-            aksi.append(f"⏳ TUNGGU harga masuk zona entry: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
+        aksi.append(f"🟡 Entry sizing 50% saja: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
         aksi.append(f"🎯 TARGET 1: {lvl['target_1']:,.0f}   TARGET 2: {lvl['target_2']:,.0f}")
-        aksi.append(f"📐 R/R saat ini ≈ 1 : {rr_val:.1f}")
+        aksi.append(f"📐 R/R saat ini ≈ 1:{rr_val:.1f}")
+
     elif "BUY" in sinyal:
-        if h["accum_confirm"]:
+        if h["accum_confirm"] or h.get("multi_day_accum"):
             aksi.append("🏦 Akumulasi institusional terkonfirmasi — sinyal lebih kuat dari biasa!")
+        if h.get("bb_squeeze"):
+            aksi.append("🔥 BB Squeeze aktif — posisikan sebelum breakout untuk R/R terbaik!")
         if h["in_entry"]:
-            aksi.append(f"🟢 ENTRY sekarang — harga {p:,.0f} ada di zona sweet spot")
+            aksi.append(f"🟢 ENTRY sekarang — harga {p:,.0f} di zona sweet spot")
         else:
             aksi.append(f"⏳ TUNGGU pullback ke zona entry: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
         aksi.append(f"🛑 CUTLOSS jika daily close < {lvl['cutloss']:,.0f}")
         aksi.append(f"🎯 TARGET 1: {lvl['target_1']:,.0f}   TARGET 2: {lvl['target_2']:,.0f}")
-        aksi.append(f"📐 R/R saat ini ≈ 1 : {rr_val:.1f}")
+        aksi.append(f"📐 R/R saat ini ≈ 1:{rr_val:.1f}")
         aksi.append(f"💰 {atr_label}")
         if sizing:
             aksi.append(f"🎲 Sizing saran: {sizing}% dari alokasi posisi")
+
     elif "WAIT" in sinyal:
         if not h["dist_trap"]:
-            aksi.append(f"⏳ WAIT — konfluensi belum cukup kuat")
+            aksi.append("⏳ WAIT — konfluensi belum cukup kuat")
             aksi.append(f"👁️ Set alert di zona entry: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
-            aksi.append("👁️ Tunggu MACD cross up + HA hijau + CQS > 0.6 sebagai konfirmasi")
+            aksi.append("👁️ Tunggu: MACD cross up + HA hijau + CQS > 0.6 + volume konfirmasi")
+            if h.get("bb_squeeze"):
+                aksi.append("🔥 BB Squeeze terdeteksi — pantau ketat, breakout bisa terjadi tiba-tiba!")
     else:
         aksi.append("🔴 JANGAN masuk posisi baru — sinyal bearish dominan")
         aksi.append("📤 Jika pegang: pertimbangkan REDUCE atau EXIT bertahap")
