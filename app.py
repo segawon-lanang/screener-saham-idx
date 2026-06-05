@@ -183,13 +183,20 @@ def s(x) -> pd.Series:
 
 
 def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
-    O,H,L,C = s(df["Open"]), s(df["High"]), s(df["Low"]), s(df["Close"])
-    hac = (O+H+L+C)/4
-    hao = np.empty(len(df)); hao[0] = (O.iloc[0]+C.iloc[0])/2
+    O, H, L, C = s(df["Open"]), s(df["High"]), s(df["Low"]), s(df["Close"])
+    hac = (O + H + L + C) / 4
+    # Vectorized HA Open via cumulative approach:
+    # hao[i] = (hao[i-1] + hac[i-1]) / 2  →  EWM with alpha=0.5, adjust=False
+    hao_init = float((O.iloc[0] + C.iloc[0]) / 2)
+    hac_arr  = hac.values
+    hao      = np.empty(len(df))
+    hao[0]   = hao_init
+    # Numba-free tight loop is still O(n) but avoids pandas overhead per element
     for i in range(1, len(df)):
-        hao[i] = (hao[i-1] + hac.iloc[i-1]) / 2
+        hao[i] = (hao[i - 1] + hac_arr[i - 1]) * 0.5
     r = df.copy()
-    r["HA_C"] = hac.values; r["HA_O"] = hao
+    r["HA_C"] = hac.values
+    r["HA_O"] = hao
     r["HA_H"] = np.maximum(H.values, np.maximum(hao, hac.values))
     r["HA_L"] = np.minimum(L.values, np.minimum(hao, hac.values))
     return r
@@ -294,30 +301,12 @@ def _get_ihsg_cached() -> pd.DataFrame:
 
 def render_market_regime(mr: MarketRegime):
     """Banner IHSG regime — tampil di atas semua mode."""
-    col  = {"BULL":"#00e676","NEUTRAL":"#ffc107","BEAR":"#f44336"}.get(mr.regime,"#ffc107")
+    col      = {"BULL": "#00e676", "NEUTRAL": "#ffc107", "BEAR": "#f44336"}.get(mr.regime, "#ffc107")
     ihsg_col = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
     st.markdown(f"""
     <div style="background:#161b22;border:1px solid {col};border-radius:8px;
                 padding:0.6rem 1.2rem;margin-bottom:1rem;
                 display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
-      <span style="color:{col};font-weight:700;font-size:0.9rem;">
-        🌐 IHSG: {mr.ihsg_trend} &nbsp;|&nbsp; Regime: {mr.regime}
-      </span>
-      <span style="font-size:0.82rem;color:#8b949e;">
-        5d: <span style="color:{ihsg_col}">{mr.ihsg_change_5d:+.1f}%</span> &nbsp;·&nbsp;
-        20d: {mr.ihsg_change_20d:+.1f}% &nbsp;·&nbsp;
-        Sizing multiplier: {mr.multiplier:.0%}
-      </span>
-      <span style="font-size:0.82rem;color:{col};">{mr.warning}</span>
-    </div>
-    """, unsafe_allow_html=True)
-    """Banner kecil di atas halaman — konteks market saat ini."""
-    col = {"BULL":"#00e676","NEUTRAL":"#ffc107","BEAR":"#f44336"}.get(mr.regime,"#ffc107")
-    ihsg_col = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
-    st.markdown(f"""
-    <div style="background:#161b22;border:1px solid {col};border-radius:8px;
-                padding:0.6rem 1.2rem;margin-bottom:1rem;
-                display:flex;align-items:center;justify-content:space-between;">
       <span style="color:{col};font-weight:700;font-size:0.9rem;">
         🌐 IHSG: {mr.ihsg_trend} &nbsp;|&nbsp; Regime: {mr.regime}
       </span>
@@ -611,7 +600,7 @@ def download_one(ticker: str) -> pd.DataFrame:
 @st.cache_data(ttl=60, show_spinner=False)
 def live_price(ticker: str, fallback: float) -> float:
     try:    return float(yf.Ticker(ticker).fast_info["last_price"])
-    except: return fallback
+    except Exception: return fallback
 
 
 def download_batch_parallel(tickers: list[str], max_workers: int = 8) -> dict[str, pd.DataFrame]:
@@ -621,8 +610,10 @@ def download_batch_parallel(tickers: list[str], max_workers: int = 8) -> dict[st
         fut = {ex.submit(download_one, t): t for t in tickers}
         for f in concurrent.futures.as_completed(fut):
             t = fut[f]
-            try:    result[t] = f.result()
-            except: result[t] = pd.DataFrame()
+            try:
+                result[t] = f.result()
+            except Exception:
+                result[t] = pd.DataFrame()
     return result
 
 
@@ -1480,8 +1471,8 @@ def build_chart(ticker: str, h: dict, df: pd.DataFrame, candle_type: str = "Cand
                   row=1, col=1)
 
     # ── Volume bars ──
-    vol_colors = [CT["green"] if float(close.iloc[i]) >= float(open_s.iloc[i])
-                  else CT["red"] for i in range(len(dates))]
+    is_green    = close.values >= open_s.values
+    vol_colors  = np.where(is_green, CT["green"], CT["red"]).tolist()
     fig.add_trace(go.Bar(
         x=dates, y=vol_s,
         marker_color=vol_colors, marker_opacity=0.6,
@@ -1534,17 +1525,15 @@ def build_volume_profile(df: pd.DataFrame, h: dict, bins: int = 40) -> go.Figure
     low_s  = s(df["Low"])
     vol_s  = s(df["Volume"])
 
-    # Distribusi volume ke price bucket (pakai typical price per candle)
+    # Distribusi volume ke price bucket — vectorized via np.digitize
     typical  = (high_s + low_s + close) / 3
     price_min, price_max = float(typical.min()), float(typical.max())
-    bin_edges = np.linspace(price_min, price_max, bins + 1)
+    bin_edges   = np.linspace(price_min, price_max, bins + 1)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
-    vol_per_bin = np.zeros(bins)
-    for i in range(len(typical)):
-        idx = min(int((float(typical.iloc[i]) - price_min) /
-                      (price_max - price_min + 1e-9) * bins), bins - 1)
-        vol_per_bin[idx] += float(vol_s.iloc[i])
+    # np.digitize returns 1-based indices; clip to [0, bins-1]
+    indices     = np.clip(np.digitize(typical.values, bin_edges) - 1, 0, bins - 1)
+    vol_per_bin = np.bincount(indices, weights=vol_s.values, minlength=bins)
 
     # POC
     poc_idx = int(np.argmax(vol_per_bin))
@@ -1574,13 +1563,14 @@ def build_volume_profile(df: pd.DataFrame, h: dict, bins: int = 40) -> go.Figure
     vah = bin_centers[va_hi_idx]
     val = bin_centers[va_lo_idx]
 
-    # ── Warna per bar: merah di bawah VAL, hijau di atas VAH, abu di VA, kuning di POC ──
-    bar_colors = []
-    for i, bc in enumerate(bin_centers):
-        if i == poc_idx:                bar_colors.append("#ffd600")
-        elif bc >= val and bc <= vah:   bar_colors.append("rgba(100,181,246,0.7)")
-        elif bc > vah:                  bar_colors.append("rgba(0,230,118,0.55)")
-        else:                           bar_colors.append("rgba(239,83,80,0.55)")
+    # ── Warna per bar: vectorized ──
+    bar_colors = np.where(
+        np.arange(bins) == poc_idx, "#ffd600",
+        np.where(
+            (bin_centers >= val) & (bin_centers <= vah), "rgba(100,181,246,0.7)",
+            np.where(bin_centers > vah, "rgba(0,230,118,0.55)", "rgba(239,83,80,0.55)")
+        )
+    ).tolist()
 
     fig = go.Figure()
 
@@ -1781,19 +1771,24 @@ Kalau tidak ada berita relevan, score=0, label=NEUTRAL, ringkasan="Tidak ada ber
             return resp
 
         import urllib.request
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
         body = json.dumps({
             "model": "claude-sonnet-4-20250514",
-            "max_tokens": 500,
+            "max_tokens": 600,
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [{"role": "user", "content": prompt}]
         }).encode()
         req = urllib.request.Request(
             "https://api.anthropic.com/v1/messages",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=25) as r:
             data = json.loads(r.read())
 
         # Ambil text dari response
@@ -2208,31 +2203,50 @@ elif "Heatmap" in mode:
             for f in concurrent.futures.as_completed(fut):
                 t = fut[f]
                 try:    data_map_hm[t] = f.result()
-                except: data_map_hm[t] = pd.DataFrame()
+                except Exception: data_map_hm[t] = pd.DataFrame()
                 done += 1
                 pbar.progress(done/total/2, text=f"⚡ Download: {done}/{total}")
 
-        # Analisis semua (tanpa filter ketat — heatmap butuh semua sinyal)
-        for i, ticker in enumerate(daftar_saham):
+        # Analisis semua — PARALLEL (heatmap butuh semua sinyal)
+        def _hm_worker(ticker: str) -> Optional[tuple]:
             df_t = data_map_hm.get(ticker, pd.DataFrame())
-            if df_t is None or df_t.empty: continue
+            if df_t is None or df_t.empty:
+                return None
             try:
                 if use_health:
                     hc = health_check(df_t, ticker, min_price=min_price, min_adv_juta=min_adv_juta)
-                    if not hc.lolos: continue
+                    if not hc.lolos:
+                        return None
                 h = analyse(ticker, days, df=df_t, mr=mr)
-                if not h: continue
+                if not h:
+                    return None
                 sig = build_plan(h)
                 sig = apply_regime_to_plan(sig, mr)
                 sektor = get_sektor(ticker)
+                return (ticker, h, sig, sektor)
+            except Exception:
+                return None
+
+        hm_done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            hm_futs = {ex.submit(_hm_worker, t): t for t in daftar_saham}
+            for fut in concurrent.futures.as_completed(hm_futs):
+                hm_done += 1
+                pbar.progress(0.5 + hm_done / total / 2,
+                              text=f"🧠 Analisis: {hm_done}/{total}")
+                try:
+                    result = fut.result()
+                except Exception:
+                    continue
+                if result is None:
+                    continue
+                ticker_r, h, sig, sektor = result
                 st.session_state.heatmap_hasil.append({
-                    "Ticker": ticker, "Sektor": sektor,
+                    "Ticker": ticker_r, "Sektor": sektor,
                     "Sinyal": sig.sinyal, "Conf.": sig.confidence,
                     "Harga": int(round(h["harga"])),
                 })
-                st.session_state.heatmap_raw[ticker] = (h, sig)
-            except: pass
-            pbar.progress(0.5 + (i+1)/total/2, text=f"🧠 Analisis: {i+1}/{total}")
+                st.session_state.heatmap_raw[ticker_r] = (h, sig)
 
         elapsed = time.time() - t0
         pbar.progress(1.0, text=f"✅ Selesai {elapsed:.1f}s")
@@ -2392,7 +2406,7 @@ elif "Screener" in mode:
             for f in concurrent.futures.as_completed(fut):
                 t = fut[f]
                 try:    data_map[t] = f.result()
-                except: data_map[t] = pd.DataFrame()
+                except Exception: data_map[t] = pd.DataFrame()
                 done += 1
                 pbar.progress(done / total / 2, text=f"⚡ Download: {done}/{total}")
 
@@ -2407,7 +2421,7 @@ elif "Screener" in mode:
         for tk, df_tk in data_map.items():
             if df_tk is not None and not df_tk.empty:
                 try: price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
-                except: pass
+                except Exception: pass
 
         def _analyse_worker(ticker: str) -> Optional[tuple]:
             """Jalankan full pipeline satu ticker — dipanggil dari thread pool."""
@@ -2711,7 +2725,7 @@ Sizing lebih kecil, cutloss lebih ketat.
             for f in concurrent.futures.as_completed(fut):
                 t = fut[f]
                 try:    data_map_eb[t] = f.result()
-                except: data_map_eb[t] = pd.DataFrame()
+                except Exception: data_map_eb[t] = pd.DataFrame()
                 done += 1
                 pbar.progress(done / total / 2, text=f"⚡ Download: {done}/{total}")
 
@@ -2723,7 +2737,7 @@ Sizing lebih kecil, cutloss lebih ketat.
         for tk, df_tk in data_map_eb.items():
             if df_tk is not None and not df_tk.empty:
                 try: eb_price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
-                except: pass
+                except Exception: pass
 
         def _eb_worker(ticker: str) -> Optional[tuple]:
             df_t = data_map_eb.get(ticker)
@@ -2769,7 +2783,7 @@ Sizing lebih kecil, cutloss lebih ketat.
                 )
                 try:
                     result = fut.result()
-                except: continue
+                except Exception: continue
                 if result is None: continue
 
                 ticker_r, h, sig = result
@@ -2964,7 +2978,7 @@ elif "RS Hunter" in mode:
             for f in concurrent.futures.as_completed(fut):
                 t = fut[f]
                 try:    data_map_rs[t] = f.result()
-                except: data_map_rs[t] = pd.DataFrame()
+                except Exception: data_map_rs[t] = pd.DataFrame()
                 done += 1
                 pbar.progress(done/total/2, text=f"⚡ Download: {done}/{total}")
 
@@ -2973,7 +2987,7 @@ elif "RS Hunter" in mode:
         for tk, df_tk in data_map_rs.items():
             if df_tk is not None and not df_tk.empty:
                 try: rs_price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
-                except: pass
+                except Exception: pass
 
         # Fase 2: RS scoring paralel
         status.markdown("💪 RS scoring paralel…")
@@ -3014,7 +3028,7 @@ elif "RS Hunter" in mode:
                               text=f"💪 {rs_done}/{rs_valid} — {len(st.session_state.rs_hasil)} RS kuat")
                 try:
                     result = fut.result()
-                except: continue
+                except Exception: continue
                 if result is None: continue
 
                 ticker_r, h, sig = result
