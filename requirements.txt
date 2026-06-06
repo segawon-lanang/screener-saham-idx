@@ -1,8 +1,7 @@
-streamlit
-pandas
-numpy
-yfinance
-ta
-scipy
-requests-cache
-urllib3
+streamlit>=1.35.0
+numpy>=1.26.0
+pandas>=2.2.0
+yfinance>=0.2.40
+ta>=0.11.0
+plotly>=5.22.0
+scipy>=1.13.0
