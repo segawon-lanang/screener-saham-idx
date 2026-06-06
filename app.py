@@ -327,96 +327,64 @@ def render_market_regime(mr: MarketRegime):
     chg5_col  = "#00e676" if mr.ihsg_change_5d >= 0 else "#f44336"
     chg20_col = "#00e676" if mr.ihsg_change_20d >= 0 else "#f44336"
     arrow     = "▲" if mr.ihsg_chg1d >= 0 else "▼"
+    rng       = mr.ihsg_high - mr.ihsg_low
+    pos       = max(2, min(98, ((mr.ihsg_last - mr.ihsg_low) / rng * 100) if rng > 0 else 50))
 
-    # Range bar hari ini: posisi close dalam range H-L
-    rng   = mr.ihsg_high - mr.ihsg_low
-    pos   = ((mr.ihsg_last - mr.ihsg_low) / rng * 100) if rng > 0 else 50
-    pos   = max(2, min(98, pos))
+    html = (
+        f'<div style="background:#161b22;border:1px solid {col};border-radius:10px;'
+        f'padding:0.75rem 1.4rem;margin-top:0.5rem;margin-bottom:1rem;">'
 
-    st.markdown(f"""
-    <div style="background:#161b22;border:1px solid {col};border-radius:10px;
-                padding:0.75rem 1.4rem;margin-top:0.5rem;margin-bottom:1rem;">
+        f'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem 1.5rem;">'
 
-      <!-- Row 1: Regime badge + IHSG price + change -->
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem 1.5rem;">
+        f'<div style="display:flex;align-items:center;gap:0.75rem;">'
+        f'<span style="color:{col};font-weight:700;font-size:0.9rem;background:{col}18;border:1px solid {col}55;'
+        f'border-radius:6px;padding:2px 10px;white-space:nowrap;">{mr.regime}</span>'
+        f'<span style="color:#8b949e;font-size:0.82rem;">🌐 IHSG &nbsp;·&nbsp; {mr.ihsg_trend}</span>'
+        f'</div>'
 
-        <!-- Kiri: Regime + trend -->
-        <div style="display:flex;align-items:center;gap:0.75rem;">
-          <span style="color:{col};font-weight:700;font-size:0.9rem;
-                       background:{col}18;border:1px solid {col}55;
-                       border-radius:6px;padding:2px 10px;white-space:nowrap;">
-            {mr.regime}
-          </span>
-          <span style="color:#8b949e;font-size:0.82rem;">
-            🌐 IHSG &nbsp;·&nbsp; {mr.ihsg_trend}
-          </span>
-        </div>
+        f'<div style="display:flex;align-items:baseline;gap:0.6rem;">'
+        f'<span style="font-family:monospace;font-size:1.5rem;font-weight:700;color:#e6edf3;">{mr.ihsg_last:,.2f}</span>'
+        f'<span style="font-family:monospace;font-size:1rem;font-weight:600;color:{chg_col};">{arrow} {mr.ihsg_chg1d:+.2f}%</span>'
+        f'<span style="font-size:0.78rem;color:#8b949e;">vs prev {mr.ihsg_prev:,.2f}</span>'
+        f'</div>'
 
-        <!-- Tengah: Harga + change 1d -->
-        <div style="display:flex;align-items:baseline;gap:0.6rem;">
-          <span style="font-family:'IBM Plex Mono',monospace;font-size:1.5rem;
-                       font-weight:700;color:#e6edf3;">
-            {mr.ihsg_last:,.2f}
-          </span>
-          <span style="font-family:'IBM Plex Mono',monospace;font-size:1rem;
-                       font-weight:600;color:{chg_col};">
-            {arrow} {mr.ihsg_chg1d:+.2f}%
-          </span>
-          <span style="font-size:0.78rem;color:#8b949e;">
-            vs prev {mr.ihsg_prev:,.2f}
-          </span>
-        </div>
+        f'<span style="font-size:0.82rem;color:{col};white-space:nowrap;">{mr.warning}</span>'
+        f'</div>'
 
-        <!-- Kanan: Warning -->
-        <span style="font-size:0.82rem;color:{col};white-space:nowrap;">{mr.warning}</span>
-      </div>
+        f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:0.4rem 1.6rem;margin-top:0.55rem;">'
 
-      <!-- Row 2: OHLC + multi-period change + range bar -->
-      <div style="display:flex;align-items:center;flex-wrap:wrap;
-                  gap:0.4rem 1.6rem;margin-top:0.55rem;">
+        f'<span style="font-size:0.78rem;color:#8b949e;font-family:monospace;">'
+        f'O&nbsp;<span style="color:#c9d1d9;">{mr.ihsg_open:,.2f}</span>'
+        f'&nbsp;H&nbsp;<span style="color:#00e676;">{mr.ihsg_high:,.2f}</span>'
+        f'&nbsp;L&nbsp;<span style="color:#f44336;">{mr.ihsg_low:,.2f}</span>'
+        f'</span>'
 
-        <!-- OHLC -->
-        <span style="font-size:0.78rem;color:#8b949e;font-family:'IBM Plex Mono',monospace;">
-          O&nbsp;<span style="color:#c9d1d9;">{mr.ihsg_open:,.2f}</span>
-          &nbsp;H&nbsp;<span style="color:#00e676;">{mr.ihsg_high:,.2f}</span>
-          &nbsp;L&nbsp;<span style="color:#f44336;">{mr.ihsg_low:,.2f}</span>
-        </span>
+        f'<span style="color:#30363d;">|</span>'
 
-        <!-- Divider -->
-        <span style="color:#30363d;">|</span>
+        f'<span style="font-size:0.78rem;color:#8b949e;">'
+        f'5d:&nbsp;<span style="color:{chg5_col};font-weight:600;">{mr.ihsg_change_5d:+.2f}%</span>'
+        f'&nbsp;&nbsp;20d:&nbsp;<span style="color:{chg20_col};font-weight:600;">{mr.ihsg_change_20d:+.2f}%</span>'
+        f'</span>'
 
-        <!-- Multi-period change -->
-        <span style="font-size:0.78rem;color:#8b949e;">
-          5d:&nbsp;<span style="color:{chg5_col};font-weight:600;">{mr.ihsg_change_5d:+.2f}%</span>
-          &nbsp;&nbsp;20d:&nbsp;<span style="color:{chg20_col};font-weight:600;">{mr.ihsg_change_20d:+.2f}%</span>
-        </span>
+        f'<span style="color:#30363d;">|</span>'
 
-        <!-- Divider -->
-        <span style="color:#30363d;">|</span>
+        f'<span style="font-size:0.78rem;color:#8b949e;">'
+        f'Sizing:&nbsp;<span style="color:{col};font-weight:600;">{mr.multiplier:.0%}</span>'
+        f'</span>'
 
-        <!-- Sizing multiplier -->
-        <span style="font-size:0.78rem;color:#8b949e;">
-          Sizing:&nbsp;<span style="color:{col};font-weight:600;">{mr.multiplier:.0%}</span>
-        </span>
+        f'<div style="flex:1;min-width:160px;max-width:300px;">'
+        f'<div style="display:flex;justify-content:space-between;font-size:0.68rem;color:#8b949e;margin-bottom:2px;font-family:monospace;">'
+        f'<span>L {mr.ihsg_low:,.0f}</span><span>Day Range</span><span>H {mr.ihsg_high:,.0f}</span>'
+        f'</div>'
+        f'<div style="background:#21262d;border-radius:4px;height:6px;position:relative;">'
+        f'<div style="position:absolute;left:{pos:.1f}%;transform:translateX(-50%);width:10px;height:6px;border-radius:3px;background:{chg_col};"></div>'
+        f'</div>'
+        f'</div>'
 
-        <!-- Day range bar -->
-        <div style="flex:1;min-width:160px;max-width:300px;">
-          <div style="display:flex;justify-content:space-between;
-                      font-size:0.68rem;color:#8b949e;margin-bottom:2px;
-                      font-family:'IBM Plex Mono',monospace;">
-            <span>L {mr.ihsg_low:,.0f}</span>
-            <span style="color:#8b949e;">Day Range</span>
-            <span>H {mr.ihsg_high:,.0f}</span>
-          </div>
-          <div style="background:#21262d;border-radius:4px;height:6px;position:relative;">
-            <div style="position:absolute;left:{pos}%;transform:translateX(-50%);
-                        width:10px;height:6px;border-radius:3px;background:{chg_col};"></div>
-          </div>
-        </div>
-
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1552,15 +1520,17 @@ def render_price_ladder(h: dict, sig: TradingSignal):
 
     html = '<table class="ladder"><tbody>'
     for label, level, pill, is_now in ladder_rows:
-        cls = 'class="ldr-current"' if is_now else ""
+        cls      = 'class="ldr-current"' if is_now else ""
+        fw       = "700" if is_now else "400"
         pct_from_now = ((level - p) / p * 100) if not is_now else 0
-        pct_str = f'<span style="color:#8b949e;font-size:0.72rem;">{pct_from_now:+.1f}%</span>' if not is_now else ""
-        html += f"""
-        <tr {cls}>
-          <td><span class="ldr-pill {pill}">{label}</span></td>
-          <td style="text-align:right;font-weight:{'700' if is_now else '400'}">{level:,.0f}</td>
-          <td style="text-align:right;">{pct_str}</td>
-        </tr>"""
+        pct_str  = f'<span style="color:#8b949e;font-size:0.72rem;">{pct_from_now:+.1f}%</span>' if not is_now else ""
+        html += (
+            f'<tr {cls}>'
+            f'<td><span class="ldr-pill {pill}">{label}</span></td>'
+            f'<td style="text-align:right;font-weight:{fw}">{level:,.0f}</td>'
+            f'<td style="text-align:right;">{pct_str}</td>'
+            f'</tr>'
+        )
     html += "</tbody></table>"
     st.markdown(html, unsafe_allow_html=True)
 
@@ -1935,22 +1905,23 @@ def render_charts(ticker: str, h: dict, ctx: str = "default"):
 
         # Summary volume profile
         harga = h["harga"]
-        st.markdown(f"""
-        <div style="font-size:0.8rem;line-height:2;">
-          <span style="color:#ffd600;">● POC</span>: {poc:,.0f}<br>
-          <span style="color:#42a5f5;">▲ VAH</span>: {vah:,.0f}
-            {'✅ di bawah' if harga < vah else '⚠️ di atas'}<br>
-          <span style="color:#42a5f5;">▼ VAL</span>: {val:,.0f}
-            {'✅ di atas' if harga > val else '⚠️ di bawah'}<br>
-          <span style="color:#ff9800;">● NOW</span>: {harga:,.0f}<br>
-          <br>
-          <span style="font-size:0.75rem;color:#8b949e;">
-          {"🟢 Harga dalam Value Area — support kuat" if val <= harga <= vah
-           else "🔼 Di atas VA — buyer dominan" if harga > vah
-           else "🔽 Di bawah VA — seller dominan"}
-          </span>
-        </div>
-        """, unsafe_allow_html=True)
+        _vah_label = "✅ di bawah" if harga < vah else "⚠️ di atas"
+        _val_label = "✅ di atas"  if harga > val else "⚠️ di bawah"
+        if val <= harga <= vah:
+            _va_msg = "🟢 Harga dalam Value Area — support kuat"
+        elif harga > vah:
+            _va_msg = "🔼 Di atas VA — buyer dominan"
+        else:
+            _va_msg = "🔽 Di bawah VA — seller dominan"
+        st.markdown(
+            f'<div style="font-size:0.8rem;line-height:2;">'
+            f'<span style="color:#ffd600;">● POC</span>: {poc:,.0f}<br>'
+            f'<span style="color:#42a5f5;">▲ VAH</span>: {vah:,.0f} {_vah_label}<br>'
+            f'<span style="color:#42a5f5;">▼ VAL</span>: {val:,.0f} {_val_label}<br>'
+            f'<span style="color:#ff9800;">● NOW</span>: {harga:,.0f}<br><br>'
+            f'<span style="font-size:0.75rem;color:#8b949e;">{_va_msg}</span>'
+            f'</div>',
+            unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2235,32 +2206,31 @@ with st.sidebar:
     st.divider()
 
     # ── IHSG mini status di sidebar ──
-    _mr_sb = get_market_regime()
+    _mr_sb  = get_market_regime()
     _col_sb = {"BULL": "#00e676", "NEUTRAL": "#ffc107", "BEAR": "#f44336"}.get(_mr_sb.regime, "#ffc107")
     _cc_sb  = "#00e676" if _mr_sb.ihsg_chg1d >= 0 else "#f44336"
+    _c5_sb  = "#00e676" if _mr_sb.ihsg_change_5d >= 0 else "#f44336"
     _arrow  = "▲" if _mr_sb.ihsg_chg1d >= 0 else "▼"
-    st.markdown(f"""
-    <div style="background:#0d1117;border:1px solid {_col_sb}44;border-radius:8px;
-                padding:0.55rem 0.8rem;margin-bottom:0.6rem;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-size:0.72rem;color:#8b949e;">🌐 IHSG</span>
-        <span style="font-size:0.7rem;background:{_col_sb}22;color:{_col_sb};
-                     border-radius:4px;padding:1px 7px;font-weight:700;">{_mr_sb.regime}</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:4px;">
-        <span style="font-family:'IBM Plex Mono',monospace;font-size:1.05rem;
-                     font-weight:700;color:#e6edf3;">{_mr_sb.ihsg_last:,.2f}</span>
-        <span style="font-family:'IBM Plex Mono',monospace;font-size:0.82rem;
-                     font-weight:600;color:{_cc_sb};">{_arrow} {_mr_sb.ihsg_chg1d:+.2f}%</span>
-      </div>
-      <div style="font-size:0.68rem;color:#8b949e;margin-top:3px;
-                  font-family:'IBM Plex Mono',monospace;">
-        H&nbsp;<span style="color:#00e676;">{_mr_sb.ihsg_high:,.2f}</span>
-        &nbsp;L&nbsp;<span style="color:#f44336;">{_mr_sb.ihsg_low:,.2f}</span>
-        &nbsp;·&nbsp;5d&nbsp;<span style="color:{'#00e676' if _mr_sb.ihsg_change_5d>=0 else '#f44336'};">{_mr_sb.ihsg_change_5d:+.1f}%</span>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    _sb_html = (
+        f'<div style="background:#0d1117;border:1px solid {_col_sb}44;border-radius:8px;'
+        f'padding:0.55rem 0.8rem;margin-bottom:0.6rem;">'
+        f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+        f'<span style="font-size:0.72rem;color:#8b949e;">🌐 IHSG</span>'
+        f'<span style="font-size:0.7rem;background:{_col_sb}22;color:{_col_sb};'
+        f'border-radius:4px;padding:1px 7px;font-weight:700;">{_mr_sb.regime}</span>'
+        f'</div>'
+        f'<div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:4px;">'
+        f'<span style="font-family:monospace;font-size:1.05rem;font-weight:700;color:#e6edf3;">{_mr_sb.ihsg_last:,.2f}</span>'
+        f'<span style="font-family:monospace;font-size:0.82rem;font-weight:600;color:{_cc_sb};">{_arrow} {_mr_sb.ihsg_chg1d:+.2f}%</span>'
+        f'</div>'
+        f'<div style="font-size:0.68rem;color:#8b949e;margin-top:3px;font-family:monospace;">'
+        f'H&nbsp;<span style="color:#00e676;">{_mr_sb.ihsg_high:,.2f}</span>'
+        f'&nbsp;L&nbsp;<span style="color:#f44336;">{_mr_sb.ihsg_low:,.2f}</span>'
+        f'&nbsp;·&nbsp;5d&nbsp;<span style="color:{_c5_sb};">{_mr_sb.ihsg_change_5d:+.1f}%</span>'
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(_sb_html, unsafe_allow_html=True)
 
     # ── Indikator badge list ──
     _scipy_badge = (
