@@ -227,6 +227,27 @@ def rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
     return 100 - 100/(1 + g/l.replace(0, 1e-9))
 
 
+def finite_float(value, default: float = 0.0) -> float:
+    """Return angka float yang aman untuk scoring dan tampilan."""
+    try:
+        value = float(value)
+        return value if np.isfinite(value) else default
+    except Exception:
+        return default
+
+
+def streak_count(flags: pd.Series, expected: bool = True) -> int:
+    """Hitung streak terbaru untuk candle hijau/merah tanpa tertukar."""
+    arr = flags.astype(bool).to_numpy()
+    count = 0
+    for flag in arr[::-1]:
+        if flag == expected:
+            count += 1
+        else:
+            break
+    return count
+
+
 # ══════════════════════════════════════════════════════════════
 # MARKET REGIME  (IHSG context — filter entry saat pasar bearish)
 # ══════════════════════════════════════════════════════════════
@@ -689,6 +710,7 @@ def download_batch_parallel(tickers: list[str], max_workers: int = 8) -> dict[st
 # ══════════════════════════════════════════════════════════════
 def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
             mr: Optional[MarketRegime] = None) -> Optional[dict]:
+    use_live_price = df is None
     if df is None:
         df = download_one(ticker)
     if df is None or df.empty:
@@ -703,7 +725,9 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
     high   = s(df["High"])
     low    = s(df["Low"])
     volume = s(df["Volume"])
-    harga  = live_price(ticker, float(close.iloc[-1]))
+    if len(close) < 80:
+        return None
+    harga  = live_price(ticker, float(close.iloc[-1])) if use_live_price else float(close.iloc[-1])
 
     # ── Ichimoku ──
     ichi    = IchimokuIndicator(high=high, low=low)
@@ -742,31 +766,33 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
     rsi_min = rsi14.rolling(stoch_period).min()
     rsi_max = rsi14.rolling(stoch_period).max()
     stoch_rsi = ((rsi14 - rsi_min) / (rsi_max - rsi_min + 1e-9) * 100)
-    srsi_k = float(stoch_rsi.rolling(3).mean().iloc[-1])
-    srsi_d = float(stoch_rsi.rolling(3).mean().rolling(3).mean().iloc[-1])
+    srsi_k = finite_float(stoch_rsi.rolling(3).mean().iloc[-1], 50.0)
+    srsi_d = finite_float(stoch_rsi.rolling(3).mean().rolling(3).mean().iloc[-1], 50.0)
     srsi_oversold   = srsi_k < 20
     srsi_overbought = srsi_k > 80
     srsi_cross_up   = srsi_k > srsi_d and srsi_k < 50
 
     # ── ATR (volatility sizing) ──
-    atr_val = float(AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1])
+    atr_val = finite_float(AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1], 0.0)
     atr_pct = atr_val / harga * 100 if harga > 0 else 0
 
     # ── RSI 14 standard ──
-    rsi_now = float(rsi14.iloc[-1])
+    rsi_now = finite_float(rsi14.iloc[-1], 50.0)
 
     # ── Volume ──
-    adv20   = float(volume.iloc[-21:-1].mean())
+    adv20   = finite_float(volume.iloc[-21:-1].mean(), 0.0)
     vol_rel = round(float(volume.iloc[-1]) / adv20, 2) if adv20 > 0 else 0.0
 
     # ── Volume Profile support (simplified: VWAP area) ──
-    vwap = float((close * volume).rolling(20).sum().iloc[-1] /
-                 volume.rolling(20).sum().iloc[-1])
+    vwap_denom = finite_float(volume.rolling(20).sum().iloc[-1], 0.0)
+    vwap = finite_float((close * volume).rolling(20).sum().iloc[-1] / vwap_denom, harga) if vwap_denom > 0 else harga
     price_above_vwap = harga > vwap
 
     # ── Fibonacci (adaptive lookback) ──
     sh, sl = recent_swings(df, adaptive_days)
     diff = sh - sl
+    if diff <= 0 or not np.isfinite(diff):
+        return None
     lvl = {
         "target_2"   : sh + diff * 0.618,
         "target_1"   : sh,
@@ -784,7 +810,9 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
     # ── Heikin Ashi ──
     ha = heikin_ashi(df)
     ha_green   = float(ha["HA_C"].iloc[-1]) > float(ha["HA_O"].iloc[-1])
-    ha_seq     = int((ha["HA_C"] > ha["HA_O"]).iloc[::-1].cumprod().sum())
+    ha_flags   = ha["HA_C"] > ha["HA_O"]
+    ha_seq     = streak_count(ha_flags, ha_green)
+    ha_red_seq = streak_count(ha_flags, False)
     ha_no_tail = (float(ha["HA_L"].iloc[-1]) >= float(ha["HA_O"].iloc[-1]) * 0.999) if ha_green else False
 
     # ── Candle Quality Score (CQS) — pembeda akumulasi vs distribusi ──
@@ -822,10 +850,11 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
     bb_std   = close.rolling(20).std()
     bb_upper = bb_mid + 2 * bb_std
     bb_lower = bb_mid - 2 * bb_std
-    bb_width     = float((bb_upper - bb_lower).iloc[-1]) / float(bb_mid.iloc[-1]) * 100
-    bb_width_avg = float((bb_upper - bb_lower).rolling(50).mean().iloc[-1]) / float(bb_mid.iloc[-1]) * 100
+    bb_mid_now   = finite_float(bb_mid.iloc[-1], harga)
+    bb_width     = finite_float((bb_upper - bb_lower).iloc[-1], 0.0) / bb_mid_now * 100 if bb_mid_now > 0 else 0.0
+    bb_width_avg = finite_float((bb_upper - bb_lower).rolling(50).mean().iloc[-1], bb_width) / bb_mid_now * 100 if bb_mid_now > 0 else bb_width
     bb_squeeze   = bb_width < bb_width_avg * 0.75        # bandwidth < 75% dari rata-rata → squeeze
-    bb_price_pos = float(close.iloc[-1]) / float(bb_mid.iloc[-1])  # > 1 = di atas mid = bullish
+    bb_price_pos = float(close.iloc[-1]) / bb_mid_now if bb_mid_now > 0 else 1.0  # > 1 = di atas mid = bullish
     bb_breakout_up = (float(close.iloc[-1]) > float(bb_upper.iloc[-2])  # close tembus upper band
                       and float(close.iloc[-2]) <= float(bb_upper.iloc[-2]))
 
@@ -866,18 +895,6 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
     accum_days = int(sum(1 for i in range(5)
                          if _v5[i] > _adv5 * 1.1 and _c5[i] > _o5[i]))
     multi_day_accum = accum_days >= 3   # ≥3 dari 5 hari = pola akumulasi kuat
-
-    # ── Bear Market Rally Detector ──
-    # Saham yang RS kuat + volume spike + oversold = kandidat terbang saat IHSG rebound
-    rsi_deep_oversold = rsi_now < 40
-    vol_surge_3d      = float(volume.iloc[-3:].mean()) > _adv5 * 1.5 if _adv5 > 0 else False
-    bear_rally_candidate = (
-        rs_score >= 55
-        and rsi_deep_oversold
-        and vol_surge_3d
-        and not dist_trap
-        and cqs > 0.45
-    )
 
     # ── Early Bird signals (Ichimoku pre-breakout) ──
     # Senkou A dan B 26 bar ke depan (future cloud)
@@ -981,6 +998,18 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
     except Exception:
         pass  # RS gagal tidak boleh blok analisis utama
 
+    # ── Bear Market Rally Detector ──
+    # Saham yang RS kuat + volume spike + oversold = kandidat rebound taktis.
+    rsi_deep_oversold = rsi_now < 40
+    vol_surge_3d      = finite_float(volume.iloc[-3:].mean(), 0.0) > _adv5 * 1.5 if _adv5 > 0 else False
+    bear_rally_candidate = (
+        rs_score >= 55
+        and rsi_deep_oversold
+        and vol_surge_3d
+        and not dist_trap
+        and cqs > 0.45
+    )
+
     return dict(
         ticker=ticker, harga=harga,
         # ichimoku
@@ -1005,7 +1034,7 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
         sh=sh, sl=sl, diff=diff, lvl=lvl,
         in_entry=in_entry, below_cut=below_cut, above_sh=above_sh, near_sh=near_sh,
         # ha
-        ha_green=ha_green, ha_seq=ha_seq, ha_no_tail=ha_no_tail,
+        ha_green=ha_green, ha_seq=ha_seq, ha_red_seq=ha_red_seq, ha_no_tail=ha_no_tail,
         # candle quality & distribution
         cqs=cqs, dist_trap=dist_trap, accum_confirm=accum_confirm,
         shooting_star=shooting_star, upper_shadow_ratio=upper_shadow_ratio,
@@ -1210,11 +1239,12 @@ def build_plan(h: dict) -> TradingSignal:
             alasan.append("💎 HA tanpa shadow bawah — tekanan jual nol")
     else:
         score -= WEIGHTS["ha"]
-        if h["ha_seq"] >= 3:
+        red_seq = h.get("ha_red_seq", h["ha_seq"])
+        if red_seq >= 3:
             score -= WEIGHTS["ha_seq"]
-            alasan.append(f"🔴 HA merah {h['ha_seq']} candle — tekanan jual dominan")
+            alasan.append(f"🔴 HA merah {red_seq} candle — tekanan jual dominan")
         else:
-            alasan.append(f"🔴 HA merah {h['ha_seq']} candle")
+            alasan.append(f"🔴 HA merah {red_seq} candle")
 
     # ── I. Stochastic RSI ──
     if h["srsi_cross_up"]:
@@ -1355,10 +1385,23 @@ def build_plan(h: dict) -> TradingSignal:
     else:                atr_label = f"Volatilitas Tinggi ({atr_pct:.1f}% ATR) → hati-hati, sizing 25-40%"
 
     # ── R/R ──
-    rr_val = (lvl["target_1"] - p) / max(p - lvl["cutloss"], 1)
+    # Untuk saham yang belum berada di zona entry, R/R sebaiknya dihitung dari
+    # rencana eksekusi, bukan harga saat ini. Kalau harga sudah lewat entry atas,
+    # gunakan harga saat ini agar risiko chasing tetap terlihat.
+    if h["below_cut"]:
+        entry_ref = None
+    elif h["in_entry"] or p > lvl["entry_atas"]:
+        entry_ref = p
+    else:
+        entry_ref = lvl["entry_bawah"]
+
+    if entry_ref is None or entry_ref <= lvl["cutloss"] or lvl["target_1"] <= entry_ref:
+        rr_val = 0.0
+    else:
+        rr_val = (lvl["target_1"] - entry_ref) / (entry_ref - lvl["cutloss"])
 
     # ── R/R GATE: sinyal BUY wajib punya R/R ≥ 1.5 ──
-    if "BUY" in sinyal and rr_val < 1.5:
+    if "BUY" in sinyal and (h["below_cut"] or rr_val < 1.5):
         # Turunkan sinyal satu level
         if sinyal == "STRONG BUY":
             sinyal, css, sizing = "BUY", "BUY", 75
@@ -1366,7 +1409,11 @@ def build_plan(h: dict) -> TradingSignal:
             sinyal, css, sizing = "SPEC. BUY", "SPEC-BUY", 40
         else:
             sinyal, css, sizing = "WAIT", "WAIT", 0
-        alasan.append(f"⚠️ R/R {rr_val:.1f}:1 terlalu rendah (min 1.5:1) — sinyal diturunkan satu level")
+        if h["below_cut"]:
+            alasan.append("🛑 Harga sudah di bawah cutloss — semua sinyal BUY dibatalkan")
+            sinyal, css, sizing = "WAIT", "WAIT", 0
+        else:
+            alasan.append(f"⚠️ R/R {rr_val:.1f}:1 terlalu rendah (min 1.5:1) — sinyal diturunkan satu level")
 
     # ═══════════════════════════════════════════════════
     # ACTION PLAN
@@ -1386,7 +1433,7 @@ def build_plan(h: dict) -> TradingSignal:
         aksi.append(f"🟢 Entry zona: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
         aksi.append(f"🛑 CUTLOSS KETAT: daily close < {lvl['cutloss']:,.0f} (jangan toleransi loss besar di bear market)")
         aksi.append(f"🎯 TARGET KONSERVATIF: {lvl['target_1']:,.0f} (ambil profit di T1, jangan rakus)")
-        aksi.append(f"📐 R/R: 1:{rr_val:.1f}")
+        aksi.append(f"📐 R/R: 1:{rr_val:.1f} (berdasarkan entry rencana)")
         aksi.append(f"💰 {atr_label}")
 
     elif h["shooting_star"] and "BUY" in sinyal:
@@ -1394,7 +1441,7 @@ def build_plan(h: dict) -> TradingSignal:
         aksi.append(f"🛑 CUTLOSS diperketat: jika close < {lvl['cutloss']:,.0f}")
         aksi.append(f"🟡 Entry sizing 50% saja: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
         aksi.append(f"🎯 TARGET 1: {lvl['target_1']:,.0f}   TARGET 2: {lvl['target_2']:,.0f}")
-        aksi.append(f"📐 R/R saat ini ≈ 1:{rr_val:.1f}")
+        aksi.append(f"📐 R/R ≈ 1:{rr_val:.1f} (berdasarkan entry rencana)")
 
     elif "BUY" in sinyal:
         if h["accum_confirm"] or h.get("multi_day_accum"):
@@ -1407,7 +1454,7 @@ def build_plan(h: dict) -> TradingSignal:
             aksi.append(f"⏳ TUNGGU pullback ke zona entry: {lvl['entry_bawah']:,.0f} – {lvl['entry_atas']:,.0f}")
         aksi.append(f"🛑 CUTLOSS jika daily close < {lvl['cutloss']:,.0f}")
         aksi.append(f"🎯 TARGET 1: {lvl['target_1']:,.0f}   TARGET 2: {lvl['target_2']:,.0f}")
-        aksi.append(f"📐 R/R saat ini ≈ 1:{rr_val:.1f}")
+        aksi.append(f"📐 R/R ≈ 1:{rr_val:.1f} (berdasarkan entry rencana)")
         aksi.append(f"💰 {atr_label}")
         if sizing:
             aksi.append(f"🎲 Sizing saran: {sizing}% dari alokasi posisi")
@@ -2749,6 +2796,8 @@ elif "Screener" in mode:
 
                 sig = build_plan(h)
                 sig = apply_regime_to_plan(sig, mr)
+                if "BUY" not in sig.sinyal or not sig.sizing_pct:
+                    return None
                 if sig.confidence < min_conf:
                     return None
 
@@ -2796,7 +2845,7 @@ elif "Screener" in mode:
                     "MACD":     "🚀" if h["macd_cross_up"] else ("✅" if h["macd_bull"] else "❌"),
                     "ADX":      f"{h['adx']:.0f}",
                     "RSI":      f"{h['rsi']:.0f}",
-                    "HA":       f"🟢{h['ha_seq']}c" if h["ha_green"] else f"🔴{h['ha_seq']}c",
+                    "HA":       f"🟢{h['ha_seq']}c" if h["ha_green"] else f"🔴{h.get('ha_red_seq', h['ha_seq'])}c",
                     "Vol":      f"{h['vol_rel']:.1f}×",
                 })
 
