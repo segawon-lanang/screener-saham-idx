@@ -248,6 +248,12 @@ def streak_count(flags: pd.Series, expected: bool = True) -> int:
     return count
 
 
+def price_too_far_above_entry(h: dict, tolerance_pct: float = 2.0) -> bool:
+    """True jika harga sudah terlalu jauh di atas rentang beli."""
+    entry_atas = h["lvl"]["entry_atas"]
+    return h["harga"] > entry_atas * (1 + tolerance_pct / 100)
+
+
 # ══════════════════════════════════════════════════════════════
 # MARKET REGIME  (IHSG context — filter entry saat pasar bearish)
 # ══════════════════════════════════════════════════════════════
@@ -2782,7 +2788,7 @@ elif "Screener" in mode:
                 # Filter logis cepat
                 if not (h["di_atas"] and h["tk_kj"]):
                     return None
-                if h["harga"] > h["lvl"]["entry_atas"]:
+                if price_too_far_above_entry(h):
                     return None
                 if h["vol_rel"] < min_vol_rel:
                     return None
@@ -2841,6 +2847,7 @@ elif "Screener" in mode:
                     "Conf.":    sig.confidence,
                     "Harga":    int(round(h["harga"])),
                     "Entry":    f"{int(round(h['lvl']['entry_bawah']))}–{int(round(h['lvl']['entry_atas']))}",
+                    "Jarak Entry": f"{(h['harga'] / h['lvl']['entry_atas'] - 1) * 100:+.1f}%",
                     "Target 1": int(round(h["lvl"]["target_1"])),
                     "Cutloss":  int(round(h["lvl"]["cutloss"])),
                     "R/R":      f"1:{sig.rr:.1f}" if sig.rr else "─",
@@ -3092,7 +3099,7 @@ Sizing lebih kecil, cutloss lebih ketat.
                 if ticker in eb_price_map: h["harga"] = eb_price_map[ticker]
 
                 if h["di_atas"]: return None
-                if h["harga"] > h["lvl"]["entry_atas"]: return None
+                if price_too_far_above_entry(h): return None
                 if h["early_score"] < min_eb_score: return None
                 if h["dist_trap"]: return None
                 if h["vol_rel"] < 0.3: return None
@@ -3345,7 +3352,7 @@ elif "RS Hunter" in mode:
                 h = analyse(ticker, days, df=df_t, mr=mr)
                 if not h: return None
                 if ticker in rs_price_map: h["harga"] = rs_price_map[ticker]
-                if h["harga"] > h["lvl"]["entry_atas"]: return None
+                if price_too_far_above_entry(h): return None
                 if h["dist_trap"]: return None      # distribusi aktif, skip
                 if h.get("rs_score", 0) < min_rs: return None
 
