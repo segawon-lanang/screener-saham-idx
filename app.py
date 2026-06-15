@@ -1390,7 +1390,7 @@ def build_plan(h: dict) -> TradingSignal:
     # gunakan harga saat ini agar risiko chasing tetap terlihat.
     if h["below_cut"]:
         entry_ref = None
-    elif h["in_entry"] or p > lvl["entry_atas"]:
+    elif h["in_entry"]:
         entry_ref = p
     else:
         entry_ref = lvl["entry_bawah"]
@@ -2782,6 +2782,8 @@ elif "Screener" in mode:
                 # Filter logis cepat
                 if not (h["di_atas"] and h["tk_kj"]):
                     return None
+                if h["harga"] > h["lvl"]["entry_atas"]:
+                    return None
                 if h["vol_rel"] < min_vol_rel:
                     return None
                 if require_ha and not h["ha_green"]:
@@ -3090,6 +3092,7 @@ Sizing lebih kecil, cutloss lebih ketat.
                 if ticker in eb_price_map: h["harga"] = eb_price_map[ticker]
 
                 if h["di_atas"]: return None
+                if h["harga"] > h["lvl"]["entry_atas"]: return None
                 if h["early_score"] < min_eb_score: return None
                 if h["dist_trap"]: return None
                 if h["vol_rel"] < 0.3: return None
@@ -3342,6 +3345,7 @@ elif "RS Hunter" in mode:
                 h = analyse(ticker, days, df=df_t, mr=mr)
                 if not h: return None
                 if ticker in rs_price_map: h["harga"] = rs_price_map[ticker]
+                if h["harga"] > h["lvl"]["entry_atas"]: return None
                 if h["dist_trap"]: return None      # distribusi aktif, skip
                 if h.get("rs_score", 0) < min_rs: return None
 
