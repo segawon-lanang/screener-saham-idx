@@ -722,17 +722,18 @@ def analyse(ticker: str, days: int, df: Optional[pd.DataFrame] = None,
     if df is None or df.empty:
         return None
 
-    # Adaptive lookback — sesuaikan dengan volatilitas & regime
-    if mr is None:
-        mr = get_market_regime()
-    adaptive_days = adaptive_lookback(df, days, mr)
-
     close  = s(df["Close"])
     high   = s(df["High"])
     low    = s(df["Low"])
     volume = s(df["Volume"])
     if len(close) < 80:
         return None
+
+    # Adaptive lookback — sesuaikan dengan volatilitas & regime
+    if mr is None:
+        mr = get_market_regime()
+    adaptive_days = adaptive_lookback(df, days, mr)
+
     harga  = live_price(ticker, float(close.iloc[-1])) if use_live_price else float(close.iloc[-1])
 
     # ── Ichimoku ──
@@ -1392,8 +1393,7 @@ def build_plan(h: dict) -> TradingSignal:
 
     # ── R/R ──
     # Untuk saham yang belum berada di zona entry, R/R sebaiknya dihitung dari
-    # rencana eksekusi, bukan harga saat ini. Kalau harga sudah lewat entry atas,
-    # gunakan harga saat ini agar risiko chasing tetap terlihat.
+    # rencana eksekusi, bukan harga saat ini.
     if h["below_cut"]:
         entry_ref = None
     elif h["in_entry"]:
@@ -1408,18 +1408,11 @@ def build_plan(h: dict) -> TradingSignal:
 
     # ── R/R GATE: sinyal BUY wajib punya R/R ≥ 1.5 ──
     if "BUY" in sinyal and (h["below_cut"] or rr_val < 1.5):
-        # Turunkan sinyal satu level
-        if sinyal == "STRONG BUY":
-            sinyal, css, sizing = "BUY", "BUY", 75
-        elif sinyal == "BUY":
-            sinyal, css, sizing = "SPEC. BUY", "SPEC-BUY", 40
-        else:
-            sinyal, css, sizing = "WAIT", "WAIT", 0
+        sinyal, css, sizing = "WAIT", "WAIT", 0
         if h["below_cut"]:
             alasan.append("🛑 Harga sudah di bawah cutloss — semua sinyal BUY dibatalkan")
-            sinyal, css, sizing = "WAIT", "WAIT", 0
         else:
-            alasan.append(f"⚠️ R/R {rr_val:.1f}:1 terlalu rendah (min 1.5:1) — sinyal diturunkan satu level")
+            alasan.append(f"⚠️ R/R {rr_val:.1f}:1 terlalu rendah (min 1.5:1) — sinyal BUY dibatalkan")
 
     # ═══════════════════════════════════════════════════
     # ACTION PLAN
@@ -1476,6 +1469,9 @@ def build_plan(h: dict) -> TradingSignal:
         aksi.append("🔴 JANGAN masuk posisi baru — sinyal bearish dominan")
         aksi.append("📤 Jika pegang: pertimbangkan REDUCE atau EXIT bertahap")
         aksi.append(f"❗ Level bahaya: close di bawah {lvl['cutloss']:,.0f}")
+
+    if sinyal == "WAIT":
+        confidence = min(confidence, 55)
 
     return TradingSignal(
         sinyal=sinyal, css_key=css, confidence=confidence,
@@ -2249,6 +2245,10 @@ with st.sidebar:
     require_ha  = st.toggle("Filter HA Hijau", value=True)
     min_vol_rel = st.slider("Min. Volume Relatif ×ADV20", 0.0, 3.0, 0.5, 0.1)
     min_conf    = st.slider("Min. Confidence (%)", 0, 100, 50, 5)
+    max_entry_over_pct = st.slider(
+        "Max lewat entry atas (%)", 0.0, 10.0, 2.0, 0.5,
+        help="Saham diskip jika harga sudah lebih jauh dari batas ini di atas entry atas."
+    )
     st.divider()
     st.markdown("**🏥 Liquidity Filter**")
     use_health   = st.toggle("Aktifkan filter likuiditas", value=True)
@@ -2708,7 +2708,7 @@ elif "Screener" in mode:
         f"<span style='color:#8b949e;font-size:0.85rem;'>"
         f"Filter: Ichimoku Uptrend · {'HA Hijau · ' if require_ha else ''}"
         f"Vol ≥{min_vol_rel}×ADV20 · Confidence ≥{min_conf}%  "
-        f"· {workers} parallel workers</span>",
+        f"· Max lewat entry {max_entry_over_pct:.1f}% · {workers} parallel workers</span>",
         unsafe_allow_html=True
     )
 
@@ -2758,13 +2758,6 @@ elif "Screener" in mode:
         # ── Fase 2: Analisis & scoring — PARALEL ──
         status.markdown("🧠 **Fase 2/2** — Analisis paralel + scoring…")
 
-        # Ambil close terakhir sebagai fallback harga (tanpa HTTP)
-        price_map: dict[str, float] = {}
-        for tk, df_tk in data_map.items():
-            if df_tk is not None and not df_tk.empty:
-                try: price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
-                except Exception: pass
-
         def _analyse_worker(ticker: str) -> Optional[tuple]:
             """Jalankan full pipeline satu ticker — dipanggil dari thread pool."""
             df_t = data_map.get(ticker)
@@ -2781,14 +2774,10 @@ elif "Screener" in mode:
                 if not h:
                     return None
 
-                # Pakai harga dari price_map (close terakhir) — tidak ada HTTP
-                if ticker in price_map:
-                    h["harga"] = price_map[ticker]
-
                 # Filter logis cepat
                 if not (h["di_atas"] and h["tk_kj"]):
                     return None
-                if price_too_far_above_entry(h):
+                if price_too_far_above_entry(h, max_entry_over_pct):
                     return None
                 if h["vol_rel"] < min_vol_rel:
                     return None
@@ -3079,13 +3068,6 @@ Sizing lebih kecil, cutloss lebih ketat.
         # Fase 2: scan early bird — PARALEL
         status.markdown("🐦 Scanning early signals paralel…")
 
-        # Price fallback dari close terakhir
-        eb_price_map = {}
-        for tk, df_tk in data_map_eb.items():
-            if df_tk is not None and not df_tk.empty:
-                try: eb_price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
-                except Exception: pass
-
         def _eb_worker(ticker: str) -> Optional[tuple]:
             df_t = data_map_eb.get(ticker)
             if df_t is None or df_t.empty: return None
@@ -3096,10 +3078,9 @@ Sizing lebih kecil, cutloss lebih ketat.
 
                 h = analyse(ticker, days, df=df_t, mr=mr)
                 if not h: return None
-                if ticker in eb_price_map: h["harga"] = eb_price_map[ticker]
 
                 if h["di_atas"]: return None
-                if price_too_far_above_entry(h): return None
+                if price_too_far_above_entry(h, max_entry_over_pct): return None
                 if h["early_score"] < min_eb_score: return None
                 if h["dist_trap"]: return None
                 if h["vol_rel"] < 0.3: return None
@@ -3330,13 +3311,6 @@ elif "RS Hunter" in mode:
                 done += 1
                 pbar.progress(done/total/2, text=f"⚡ Download: {done}/{total}")
 
-        # Price fallback
-        rs_price_map = {}
-        for tk, df_tk in data_map_rs.items():
-            if df_tk is not None and not df_tk.empty:
-                try: rs_price_map[tk] = float(s(df_tk["Close"]).iloc[-1])
-                except Exception: pass
-
         # Fase 2: RS scoring paralel
         status.markdown("💪 RS scoring paralel…")
 
@@ -3351,8 +3325,7 @@ elif "RS Hunter" in mode:
 
                 h = analyse(ticker, days, df=df_t, mr=mr)
                 if not h: return None
-                if ticker in rs_price_map: h["harga"] = rs_price_map[ticker]
-                if price_too_far_above_entry(h): return None
+                if price_too_far_above_entry(h, max_entry_over_pct): return None
                 if h["dist_trap"]: return None      # distribusi aktif, skip
                 if h.get("rs_score", 0) < min_rs: return None
 
