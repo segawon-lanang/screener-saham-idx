@@ -1,26 +1,28 @@
 """
-Screener Ichi-Fibo-Heikin Pro • v5.0 (Optimized Core)
-═════════════════════════════════════════════════════
-Perbaikan Kritis:
+Screener Ichi-Fibo-Heikin Pro • v5.0 (Optimized & YF Fixed)
+═════════════════════════════════════════════════════════════
+Perbaikan:
+- Fixed YFinance download error (mengganti show_errors dengan progress=False)
 - Ichimoku Cloud Shift Fixed (Masa kini, bukan masa depan)
-- Vectorized Heikin Ashi (EWM, 10x lebih cepat)
-- Market Breadth Regime (Akurat berbasis partisipasi pasar)
-- Batch YFinance Download (Anti limit/banned)
-- Streamlit Dialogs (Tanpa st.rerun yang memberatkan)
+- Vectorized Heikin Ashi (EWM, eksekusi super cepat)
+- Market Breadth Regime (Akurat berbasis persentase partisipasi pasar)
+- Batch YFinance Download (Meminimalisir API Rate Limit/Banned)
+- Streamlit Dialogs (Interaksi pop-up tanpa st.rerun)
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from ta.trend import IchimokuIndicator, EMAIndicator, MACD, ADXIndicator
+from ta.trend import IchimokuIndicator, EMAIndicator, MACD
 from ta.momentum import StochasticOscillator
 from ta.volatility import AverageTrueRange
 
-# Konfigurasi Halaman
+# ==========================================
+# 1. KONFIGURASI HALAMAN & CSS DARK MODE
+# ==========================================
 st.set_page_config(page_title="IFH Pro v5.0", layout="wide", initial_sidebar_state="expanded")
 
-# --- CUSTOM CSS (Dark Mode Pro) ---
 st.markdown("""
 <style>
     .stApp { background-color: #0E1117; color: #FAFAFA; }
@@ -33,22 +35,28 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- FUNGSI DATA & INDIKATOR ---
+# ==========================================
+# 2. FUNGSI DATA FETCHING
+# ==========================================
 @st.cache_data(ttl=3600)
 def load_tickers():
     try:
         df = pd.read_csv("emiten.csv")
         return df['ticker'].dropna().unique().tolist()
     except Exception:
+        # Fallback jika emiten.csv tidak ada
         return ["BBCA.JK", "BMRI.JK", "BREN.JK", "AMMN.JK", "TLKM.JK", "ASII.JK"]
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_batch_data(tickers, period="6mo"):
-    # Batch download efisien, meminimalisir API Rate Limit
     if not tickers: return pd.DataFrame()
-    data = yf.download(" ".join(tickers), period=period, interval="1d", group_by="ticker", threads=True, show_errors=False)
+    # FIX: Menggunakan progress=False untuk yfinance terbaru
+    data = yf.download(tickers, period=period, interval="1d", group_by="ticker", threads=True, progress=False)
     return data
 
+# ==========================================
+# 3. FUNGSI INDIKATOR TEKNIKAL
+# ==========================================
 def heikin_ashi_fast(df: pd.DataFrame) -> pd.DataFrame:
     r = pd.DataFrame(index=df.index)
     r["HA_C"] = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
@@ -61,17 +69,17 @@ def heikin_ashi_fast(df: pd.DataFrame) -> pd.DataFrame:
 def process_technical(df: pd.DataFrame):
     if len(df) < 60: return None
     
-    # 1. Ichimoku (FIXED: Shift for current cloud)
+    # -- A. Ichimoku --
     ichi = IchimokuIndicator(high=df["High"], low=df["Low"], window1=9, window2=26, window3=52)
     df["Tenkan"] = ichi.ichimoku_conversion_line()
     df["Kijun"] = ichi.ichimoku_base_line()
     df["Senkou_A_Today"] = ichi.ichimoku_a().shift(26)
     df["Senkou_B_Today"] = ichi.ichimoku_b().shift(26)
     
-    # 2. Heikin Ashi
+    # -- B. Heikin Ashi --
     ha_df = heikin_ashi_fast(df)
     
-    # 3. Momentum & Volatility
+    # -- C. Momentum & Volatility --
     df["EMA20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
     macd = MACD(df["Close"])
     df["MACD_Hist"] = macd.macd_diff()
@@ -81,32 +89,32 @@ def process_technical(df: pd.DataFrame):
     df["Stoch_K"] = stoch.stoch()
     df["Stoch_D"] = stoch.stoch_signal()
     
-    # Extract Latest Values
+    # -- D. Evaluasi Logika Terakhir --
     last = df.iloc[-1]
     last_ha = ha_df.iloc[-1]
     
-    # Base Filters
     above_kumo = last["Close"] > max(last["Senkou_A_Today"], last["Senkou_B_Today"])
     ha_bullish = last_ha["HA_C"] > last_ha["HA_O"]
     no_lower_shadow = abs(last_ha["HA_O"] - last_ha["HA_L"]) <= (last["Close"] * 0.002)
     
+    # Syarat Mutlak Screener
     if not (above_kumo and ha_bullish):
-        return None # Skip jika tidak uptrend atau momentum Heikin tidak bullish
+        return None 
         
-    # Confluence Scoring
+    # -- E. Confluence Scoring --
     score = 0
     reasons = []
     
     if last["Close"] > last["Kijun"]: 
-        score += 2; reasons.append("🟢 Harga di atas Kijun-sen")
+        score += 2; reasons.append("🟢 Harga di atas Kijun-sen (Support Kuat)")
     if last["MACD_Hist"] > 0 and last["MACD_Hist"] > df["MACD_Hist"].iloc[-2]: 
         score += 2; reasons.append("🟢 MACD Histogram Menguat")
     if last["Stoch_K"] > last["Stoch_D"] and last["Stoch_K"] < 80: 
         score += 1; reasons.append("🟢 Stochastic Golden Cross / Momentum Up")
     if no_lower_shadow: 
-        score += 3; reasons.append("🔥 Heikin Ashi Strong Bull (No Lower Shadow)")
+        score += 3; reasons.append("🔥 Heikin Ashi Strong Bull (Tanpa Ekor Bawah)")
     
-    # Fibo Levels (Simple Swing based on recent 20d extremes)
+    # -- F. Fibo Levels --
     recent = df.tail(20)
     high, low = recent["High"].max(), recent["Low"].min()
     diff = high - low
@@ -142,7 +150,9 @@ def get_market_regime(data_dict):
     elif breadth < 40: return "BEAR", breadth
     else: return "NEUTRAL", breadth
 
-# --- UI DIALOG (No st.rerun) ---
+# ==========================================
+# 4. UI POP-UP DIALOG (Tanpa Rerun)
+# ==========================================
 @st.dialog("📊 Analisis Mendalam & Action Plan")
 def show_analysis_modal(ticker, data):
     st.markdown(f"### {ticker} | Score: {data['Score']}/8")
@@ -158,9 +168,11 @@ def show_analysis_modal(ticker, data):
     c2.metric("Target Profit (Fibo Ext)", f"{data['Target']:.0f}")
     c3.metric("Stop Loss (Kijun-sen)", f"{data['Kijun']:.0f}")
     
-    st.info(f"💡 Volatilitas Harian (ATR): Rp {data['ATR']:.0f}. Atur sizing lot Anda agar kerugian maksimal 1-2% dari total modal jika menyentuh Stop Loss.")
+    st.info(f"💡 Volatilitas Harian (ATR): Rp {data['ATR']:.0f}. Atur sizing lot Anda agar kerugian maksimal 1-2% dari total modal jika harga menyentuh Stop Loss.")
 
-# --- MAIN APP ---
+# ==========================================
+# 5. MAIN APP RUNNER
+# ==========================================
 def main():
     st.title("🦅 Ichi-Fibo-Heikin Pro Screener v5.0")
     
@@ -175,22 +187,29 @@ def main():
     if run_btn:
         target_tickers = all_tickers[:limit]
         
-        with st.spinner(f"Mengunduh data {limit} emiten secara paralel..."):
+        with st.spinner(f"Mengunduh data {limit} emiten secara paralel (harap tunggu)..."):
             raw_data = fetch_batch_data(target_tickers)
         
-        # Ekstrak data ke dict
+        # Mapping MultiIndex Yahoo Finance ke Dictionary Pandas
         market_data = {}
         for t in target_tickers:
             try:
-                # Handle YF multi-ticker format
-                df = raw_data[t].copy() if isinstance(raw_data.columns, pd.MultiIndex) else raw_data.copy()
+                if isinstance(raw_data.columns, pd.MultiIndex):
+                    df = raw_data[t].copy()
+                else:
+                    df = raw_data.copy()
+                    
                 df = df.dropna(subset=['Close'])
                 if len(df) > 60 and df['Volume'].tail(10).mean() >= min_vol and df['Close'].iloc[-1] >= 50:
                     market_data[t] = df
             except Exception:
                 pass
                 
-        # Analisis Market Regime
+        if not market_data:
+            st.error("Gagal memproses data atau tidak ada saham yang memenuhi filter dasar/volume.")
+            return
+
+        # Kalkulasi Rezim Pasar
         regime, breadth_pct = get_market_regime(market_data)
         r_color = "#00C853" if regime == "BULL" else "#FF3B30" if regime == "BEAR" else "#F0B90B"
         
@@ -201,7 +220,7 @@ def main():
         </div>
         """, unsafe_allow_html=True)
         
-        # Proses Screener
+        # Eksekusi Screener
         results = {}
         progress = st.progress(0)
         
@@ -216,10 +235,9 @@ def main():
             st.warning("Tidak ada saham yang memenuhi kriteria Uptrend Kuat hari ini.")
             return
             
-        # Tampilkan Hasil
         st.success(f"Ditemukan {len(results)} saham potensial!")
         
-        # Konversi ke format tabel visual
+        # Rendering Tabel Screener
         display_data = []
         for t, r in sorted(results.items(), key=lambda x: x[1]['Score'], reverse=True):
             display_data.append({
@@ -233,11 +251,12 @@ def main():
             
         st.dataframe(pd.DataFrame(display_data), use_container_width=True, hide_index=True)
         
-        st.markdown("### 🔍 Action Panel")
+        # Rendering Action Panel Button
+        st.markdown("### 🔍 Action Panel (Klik untuk Detail)")
         cols = st.columns(6)
         for i, (tk, data) in enumerate(results.items()):
             with cols[i % 6]:
-                if st.button(f"Action {tk}", key=f"btn_{tk}", use_container_width=True):
+                if st.button(f"Lihat {tk}", key=f"btn_{tk}", use_container_width=True):
                     show_analysis_modal(tk, data)
 
 if __name__ == "__main__":
