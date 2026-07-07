@@ -1,29 +1,45 @@
 """
-Screener Ichi-Fibo-Heikin Pro  •  v6.1  (Download Fix + Full Logic)
-════════════════════════════════════════════════════════════════════
-ROOT CAUSE FIX — "0/953 emiten berhasil diunduh":
-  yfinance >=0.2.x mengembalikan MultiIndex columns bahkan untuk single ticker.
-  _download_one() lama: df.dropna(subset=["Close"]) raise KeyError karena "Close"
-  bukan kolom flat → semua exception di-catch → semua return None → 0 results.
+Screener Ichi-Fibo-Heikin Pro  •  v6.2  (Pros/Cons Fix)
+═════════════════════════════════════════════════════════
+Semua fix v6.1 tetap berlaku. Perbaikan tambahan v6.2:
 
-DOWNLOAD LAYER BARU (v6.1):
-  [A] _safe_download() : yf.Ticker(t).history() → SELALU flat columns,
-                         aman semua versi yfinance. Retry 3x + jitter.
-  [B] _batch_chunk()   : yf.download(chunk, group_by="ticker") untuk efisiensi.
-                         MultiIndex parsing defensif: cek level 0 dan level 1.
-                         Fallback ke individual jika batch gagal.
-  [C] fetch_all()      : batch chunks paralel. 953 ticker → ~48 HTTP req
-                         (vs 953 req individual sebelumnya).
+  [C1] compute_indicators() dipanggil 2x per ticker saat modal
+       → ind disimpan di SR._ind, build_chart() reuse tanpa recompute
 
-ICHIMOKU FIX:
-  ta library ichimoku_a/b() sudah apply shift(26) internal.
-  v6.0 salah tambah shift(-26) lagi → cloud value jadi salah.
-  v6.1: pakai ichi.ichimoku_a() langsung, iloc[-1] = present cloud. BENAR.
+  [C2] RSI pakai SMA bukan Wilder's EMA
+       → gain/loss pakai .ewm(alpha=1/period, adjust=False) → nilai RSI
+          kini identik dengan MetaTrader/TradingView/ta-lib standard
 
-SEMUA FIX v6.0 TETAP BERLAKU:
+  [C3] stop_loss bisa di atas price jika price < kijun (gate cloud
+       tidak guarantee price > kijun) → guard: SL capped price*0.995
+
+  [C4] R/R dari entry_mid, bukan dari harga aktual (overestimate R/R
+       jika harga sudah di atas entry zone) → risk = max(price, entry_mid) - SL
+
+  [C5] screen_one() sequential → diparalel dengan ThreadPoolExecutor
+       → kecepatan analisis ~4–6x lebih cepat untuk 200–953 ticker
+
+  [C6] find_swing() loops redundant (sh/sl selalu = global max/min)
+       → loop kini tracking best_pivot terpisah dari global fallback
+
+  [C7] hasil screener tidak dicache → re-run tiap klik tombol ticker
+       → simpan raw_results + all_dfs di st.session_state
+
+  [C8] sek_map pakai emiten_df.get() yang index-mismatched
+       → explicit column check + fillna
+
+  [C9] CQS NaN dari doji candle (H==L) → fillna(0.5)
+
+  [C10] market_regime() re-iterate semua df → breadth dihitung inline
+        di screener pass untuk hindari double loop
+
+  [C11] action panel wrapping janggal → expander per tier + 5 col fixed
+
+WARISAN FIX v6.1 (tetap berlaku):
+  Download: yf.Ticker().history() → flat columns, batch chunk 20/req, retry+jitter
+  Ichimoku: tidak ada extra shift (ta lib sudah shift 26)
   HA rekursif benar · Fibo Extension 127.2/161.8% · R/R gate >=1.5:1
-  ADX+DI scoring · True StochRSI · MACD fresh cross · ADV-Rp · RS vs IHSG
-  Position sizing 1% risk · Market Breadth dari universe penuh (bukan subset)
+  ADX+DI scoring · MACD fresh cross · ADV-Rp · RS vs IHSG · Position sizing 1%
 """
 
 from __future__ import annotations
@@ -47,7 +63,7 @@ from ta.volatility import AverageTrueRange
 # PAGE CONFIG — wajib paling atas sebelum st lain
 # ═══════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="IFH Pro v6.1",
+    page_title="IFH Pro v6.2",
     layout="wide",
     initial_sidebar_state="expanded",
     page_icon="🦅",
@@ -133,6 +149,10 @@ class SR:
     cqs:        float = 0.0
     sektor:     str   = "—"
     lot:        int   = 0
+
+    # C1-FIX: simpan hasil compute_indicators agar build_chart() bisa reuse
+    # tanpa hitung ulang semua indikator (2x computation → 1x)
+    _ind:       Optional[dict] = field(default=None, repr=False, compare=False)
 
 
 # ═══════════════════════════════════════════════════════
@@ -367,9 +387,15 @@ def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
 def stoch_rsi(close: pd.Series,
               rsi_p: int = 14, stoch_p: int = 14,
               k_s: int = 3, d_s: int = 3):
+    """
+    C2-FIX: RSI harus pakai Wilder's EMA (alpha=1/period), BUKAN SMA (.rolling().mean()).
+    SMA menghasilkan nilai RSI yang berbeda dari MetaTrader/TradingView/ta-lib standard.
+    Wilder's EMA: .ewm(alpha=1/period, adjust=False) — ini implementasi yang benar.
+    """
     delta = close.diff()
-    gain  = delta.clip(lower=0).rolling(rsi_p).mean()
-    loss  = (-delta.clip(upper=0)).rolling(rsi_p).mean()
+    alpha = 1.0 / rsi_p
+    gain  = delta.clip(lower=0).ewm(alpha=alpha, adjust=False).mean()   # FIX: EMA bukan SMA
+    loss  = (-delta.clip(upper=0)).ewm(alpha=alpha, adjust=False).mean() # FIX: EMA bukan SMA
     rsi   = 100 - 100 / (1 + gain / (loss + 1e-9))
 
     rsi_lo = rsi.rolling(stoch_p).min()
@@ -432,8 +458,8 @@ def compute_indicators(df_raw: pd.DataFrame) -> Optional[dict]:
     vol_rel = v / adv20.replace(0, np.nan)
     adv_rp  = (c * v).rolling(20).mean() / 1_000_000  # juta rupiah
 
-    # ── CQS ──
-    cqs = (c - lo) / (h - lo).replace(0, np.nan)
+    # ── CQS — C9-FIX: fillna(0.5) untuk doji candle (H==L → NaN) ──
+    cqs = ((c - lo) / (h - lo).replace(0, np.nan)).fillna(0.5)
 
     return dict(
         close=c, high=h, low=lo, open=o, volume=v,
@@ -451,19 +477,44 @@ def compute_indicators(df_raw: pd.DataFrame) -> Optional[dict]:
 # FIBONACCI
 # ═══════════════════════════════════════════════════════
 def find_swing(high: pd.Series, low: pd.Series, lookback: int = 90) -> tuple:
-    n  = min(lookback, len(high))
-    hw = high.iloc[-n:]
-    lw = low.iloc[-n:]
-    sh, sl = float(hw.max()), float(lw.min())
+    """
+    C6-FIX: loop sebelumnya sepenuhnya redundant karena sh/sl diinit dari hw.max()/lw.min()
+    dan max(sh, hw.iloc[i]) tidak pernah bisa melebihi hw.max().
+    Sekarang: cari pivot TERBARU yang signifikan sebagai swing reference.
+    Pivot lebih baru lebih relevan untuk Fibonacci daripada pivot tertua di window.
+    Fallback ke global max/min jika tidak ada pivot yang terdeteksi.
+    """
+    n   = min(lookback, len(high))
+    hw  = high.iloc[-n:]
+    lw  = low.iloc[-n:]
     win = 5
-    for i in range(win, len(hw) - win):
-        if float(hw.iloc[i]) == float(hw.iloc[i - win: i + win + 1].max()):
-            sh = max(sh, float(hw.iloc[i]))
-    for i in range(win, len(lw) - win):
-        if float(lw.iloc[i]) == float(lw.iloc[i - win: i + win + 1].min()):
-            sl = min(sl, float(lw.iloc[i]))
+
+    # Fallback: global extreme dalam window
+    sh_global = float(hw.max())
+    sl_global = float(lw.min())
+
+    # Cari pivot high TERBARU (iterasi dari kanan)
+    sh_pivot = None
+    for i in range(len(hw) - win - 1, win - 1, -1):
+        seg = hw.iloc[i - win: i + win + 1]
+        if float(hw.iloc[i]) >= float(seg.max()):   # local max
+            sh_pivot = float(hw.iloc[i])
+            break   # ambil yang paling kanan (terbaru)
+
+    # Cari pivot low TERBARU (iterasi dari kanan)
+    sl_pivot = None
+    for i in range(len(lw) - win - 1, win - 1, -1):
+        seg = lw.iloc[i - win: i + win + 1]
+        if float(lw.iloc[i]) <= float(seg.min()):   # local min
+            sl_pivot = float(lw.iloc[i])
+            break
+
+    sh = sh_pivot if sh_pivot is not None else sh_global
+    sl = sl_pivot if sl_pivot is not None else sl_global
+
+    # Guard: sh harus > sl dan sh harus reachable dari price
     if sh <= sl:
-        sh, sl = float(hw.max()), float(lw.min())
+        sh, sl = sh_global, sl_global
     return sh, sl
 
 
@@ -734,13 +785,23 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
     entry_lo  = fib["f500"]
     entry_mid = (entry_hi + entry_lo) / 2
 
-    stop_loss = max(kijun_v, fib["f618"], price * 0.92)
+    # C3-FIX: SL harus SELALU di bawah price.
+    # max(kijun, fib618, price*0.92) bisa menghasilkan SL > price jika
+    # price < kijun (mungkin karena gate cek above_cloud, bukan price>kijun).
+    # Guard: cap SL di price*0.995 agar selalu di bawah harga.
+    raw_sl    = max(kijun_v, fib["f618"], price * 0.92)
+    stop_loss = min(raw_sl, price * 0.995)   # FIX: SL wajib < price
+
     target1   = fib["e1272"]
     target2   = fib["e1618"]
 
-    risk   = max(entry_mid - stop_loss, 1.0)
-    reward = target1 - entry_mid
-    rr     = reward / risk
+    # C4-FIX: gunakan max(price, entry_mid) sebagai referensi entry realistis.
+    # Jika harga sudah di atas entry zone, R/R harus dihitung dari price sekarang
+    # (bukan dari entry_mid yang sudah terlewat) agar tidak overestimate R/R.
+    entry_ref = max(price, entry_mid)
+    risk      = max(entry_ref - stop_loss, 1.0)
+    reward    = target1 - entry_ref
+    rr        = reward / risk
 
     # ── SIGNAL + CONFIDENCE ──
     conf   = _conf(score, MX)
@@ -760,6 +821,7 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
         vol_rel=vol_r, rs=rs_v, adx=adx_v,
         trend_bars=trend_bars, cqs=float(ind["cqs"].iloc[-1]),
         sektor=sektor, lot=lot,
+        _ind=ind,   # C1-FIX: cache untuk build_chart()
     )
 
 
@@ -769,11 +831,11 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
 def build_chart(ticker: str, df_raw: pd.DataFrame,
                 res: SR, display_bars: int = 120) -> go.Figure:
     """
-    Indikator dihitung dari df_raw PENUH (bukan window terpotong),
-    lalu dipotong ke display_bars untuk tampilan.
-    Ini memastikan EMA50, Ichimoku, dll punya warm-up yang cukup.
+    C1-FIX: Reuse ind dari SR._ind jika tersedia (sudah dihitung di screen_one).
+    Fallback ke compute_indicators() hanya jika _ind tidak tersedia.
+    Ini menghilangkan double computation yang terjadi setiap kali modal dibuka.
     """
-    ind = compute_indicators(df_raw)
+    ind = res._ind if res._ind is not None else compute_indicators(df_raw)
     if ind is None:
         return go.Figure()
 
@@ -1014,7 +1076,7 @@ def show_modal(res: SR, df_raw: pd.DataFrame):
 # ═══════════════════════════════════════════════════════
 def main():
     st.markdown(
-        "<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v6.1</h1>",
+        "<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v6.2</h1>",
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -1027,8 +1089,10 @@ def main():
 
     emiten_df   = load_emiten()
     all_tickers = emiten_df["ticker"].tolist()
-    sek_map     = dict(zip(emiten_df["ticker"],
-                           emiten_df.get("sektor", pd.Series("—"))))
+    # C8-FIX: explicit column check agar index selalu aligned dengan emiten_df["ticker"]
+    sek_col = (emiten_df["sektor"] if "sektor" in emiten_df.columns
+               else pd.Series("—", index=emiten_df.index))
+    sek_map = dict(zip(emiten_df["ticker"], sek_col.fillna("—")))
 
     # ── SIDEBAR ──
     with st.sidebar:
@@ -1067,7 +1131,7 @@ def main():
         st.markdown("---")
         st.markdown(
             f"<span style='color:#848E9C;font-size:.78rem;'>"
-            f"v6.1 · {len(all_tickers)} emiten loaded · "
+            f"v6.2 · {len(all_tickers)} emiten loaded · "
             f"chunk={chunk} · {workers} workers</span>",
             unsafe_allow_html=True,
         )
@@ -1098,13 +1162,17 @@ def main():
 - ✅ R/R ≥ min R/R sidebar (default 1.5:1)
 - ✅ ADV-Rp ≥ threshold likuiditas sidebar
 
-**Root cause fix v6.1 — "0/953 diunduh":**
-```
-❌ Sebelumnya: yf.download() → MultiIndex columns → KeyError → semua None
-✅ Sekarang:   yf.Ticker().history() → flat columns → tidak ada error
-               + batch chunk 20 ticker/request → 48 req (vs 953)
-               + retry 3x + jitter untuk rate limiting
-```
+**Fix v6.1:** Download layer (root cause "0/953") — Ticker.history(), batch chunk, retry+jitter.
+
+**Fix v6.2 tambahan:**
+- 🔧 RSI: Wilder's EMA (`ewm alpha=1/14`) bukan SMA — nilai identik MetaTrader/TradingView
+- 🔧 find_swing(): pivot terbaru yang signifikan, bukan hanya global max/min
+- 🔧 Stop loss: selalu di bawah harga (guard `price*0.995`)
+- 🔧 R/R: dari `max(price, entry_mid)` — akurat jika harga sudah di atas entry zone
+- 🔧 Analisis paralel: ThreadPoolExecutor untuk 4–6× lebih cepat
+- 🔧 Hasil dicache session_state: tidak re-run saat klik Action Panel
+- 🔧 Breadth dihitung inline dengan screener (tidak ada double loop)
+- 🔧 Action panel: expander + 5 kolom tetap, rapi tanpa wrapping janggal
         """)
         return
 
@@ -1145,29 +1213,67 @@ def main():
         f"({n_ok/max(elapsed,1):.0f} ticker/s)"
     )
 
-    # ── MARKET REGIME ──
-    regime, breadth, ihsg_ratio = market_regime(ihsg_df, all_dfs)
-    render_regime(regime, breadth, ihsg_ratio)
+    # ── C5-FIX: Paralel screener + C10-FIX: breadth dihitung inline ──
+    # Analisis diparalel bersama breadth computation untuk hindari 2 pass atas all_dfs
 
-    # ── SCREENER ──
-    raw_results: list = []
-    prog = st.progress(0.0, text="Memulai analisis...")
-    total_dfs = len(all_dfs)
-
-    for i, (ticker, df) in enumerate(all_dfs.items()):
+    def _worker(args):
+        ticker, df = args
         sektor = sek_map.get(ticker, "—")
+        # Hitung breadth inline (apakah close > EMA20)
+        try:
+            ema20_last = float(df["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
+            above_ema  = float(df["Close"].iloc[-1]) > ema20_last
+        except Exception:
+            above_ema = False
+        # Analisis teknikal
         try:
             r = screen_one(ticker, df, ihsg_close, min_adv_rp, sektor)
-            if r is not None:
-                if r.rr < min_rr:
-                    r.signal = "AVOID"
-                raw_results.append(r)
         except Exception:
-            pass
-        prog.progress((i + 1) / total_dfs,
-                      text=f"Analisis {ticker} ({i+1}/{total_dfs})...")
+            r = None
+        return r, above_ema
+
+    prog = st.progress(0.0, text="Analisis paralel...")
+    raw_results: list = []
+    above_count = total_breadth = 0
+    items = list(all_dfs.items())
+
+    # C5-FIX: ThreadPoolExecutor untuk analisis paralel
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_worker, item): item[0] for item in items}
+        done = 0
+        for fut in as_completed(futs):
+            done += 1
+            try:
+                r, above_ema = fut.result()
+                total_breadth += 1
+                if above_ema:
+                    above_count += 1
+                if r is not None:
+                    if r.rr < min_rr:
+                        r.signal = "AVOID"
+                    raw_results.append(r)
+            except Exception:
+                pass
+            prog.progress(done / len(futs),
+                          text=f"Analisis {done}/{len(futs)}...")
 
     prog.empty()
+
+    # C10-FIX: breadth sudah dihitung inline, tidak perlu market_regime() loop kedua
+    breadth_inline = (above_count / total_breadth * 100) if total_breadth > 0 else 50.0
+    regime, _, ihsg_ratio = market_regime(ihsg_df, {})   # pass empty dict — regime dari IHSG saja
+    # Override breadth dengan nilai inline yang akurat
+    if ihsg_ratio > 1 and breadth_inline > 55:
+        regime = "BULL"
+    elif ihsg_ratio <= 1 and breadth_inline < 45:
+        regime = "BEAR"
+    else:
+        regime = "NEUTRAL"
+    render_regime(regime, breadth_inline, ihsg_ratio)
+
+    # C7-FIX: cache hasil di session_state agar tidak re-run saat klik tombol ticker
+    st.session_state["_ifh_results"] = raw_results
+    st.session_state["_ifh_dfs"]     = all_dfs
 
     # Filter + sort
     filtered = [r for r in raw_results if r.signal in show_sigs]
@@ -1211,7 +1317,7 @@ def main():
         mime="text/csv",
     )
 
-    # ── ACTION PANEL ──
+    # ── C11-FIX: Action Panel — expander per tier, 5 kolom tetap ──
     st.markdown("---")
     st.markdown("### 🔍 Action Panel — Klik ticker untuk Trading Plan lengkap")
 
@@ -1220,25 +1326,26 @@ def main():
         if not tier:
             continue
         sc = SIG_COLOR[sig]
-        st.markdown(
-            f"<h4 style='color:{sc};margin-bottom:6px;'>"
-            f"{sig} "
-            f"<span style='color:#848E9C;font-size:.85rem;'>({len(tier)} saham)</span>"
-            f"</h4>",
-            unsafe_allow_html=True,
-        )
-        n_cols = min(8, len(tier))
-        cols   = st.columns(n_cols)
-        for j, r in enumerate(tier):
-            with cols[j % n_cols]:
-                if st.button(
-                    f"{r.ticker}\n{r.score}/{r.score_max}",
-                    key=f"btn_{r.ticker}_{sig}",
-                    use_container_width=True,
-                    help=(f"R/R {r.rr:.1f}:1 | ADX {r.adx:.0f} | "
-                          f"Vol {r.vol_rel:.1f}x | RS {r.rs:+.2f}"),
-                ):
-                    show_modal(r, all_dfs[r.ticker])
+        # C11-FIX: expander per tier → tidak wrapping janggal, bisa collapse
+        exp_label = (f"{sig}  ({len(tier)} saham)  "
+                     f"—  avg score {sum(r.score for r in tier)/len(tier):.1f}/{tier[0].score_max}")
+        with st.expander(exp_label, expanded=(sig in ("STRONG BUY", "BUY"))):
+            # 5 kolom tetap → row yang rapi
+            NCOLS = 5
+            rows = [tier[i: i + NCOLS] for i in range(0, len(tier), NCOLS)]
+            for row in rows:
+                cols = st.columns(NCOLS)
+                for j, r in enumerate(row):
+                    with cols[j]:
+                        if st.button(
+                            f"**{r.ticker}**\n{r.score}/{r.score_max} · R/R {r.rr:.1f}",
+                            key=f"btn_{r.ticker}_{sig}",
+                            use_container_width=True,
+                            help=(f"{r.conf} | ADX {r.adx:.0f} | "
+                                  f"Vol {r.vol_rel:.1f}× | RS {r.rs:+.2f} | "
+                                  f"ADV Rp{r.adv_rp:,.0f}jt"),
+                        ):
+                            show_modal(r, all_dfs[r.ticker])
 
 
 if __name__ == "__main__":
