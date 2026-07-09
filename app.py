@@ -1,89 +1,31 @@
 """
-Screener Ichi-Fibo-Heikin Pro  •  v6.3  (Deep-Dive Algorithm Audit)
+Screener Ichi-Fibo-Heikin Pro  •  v6.4  (+ Analisa Manual)
 ════════════════════════════════════════════════════════════════════
-Semua fix v6.1/v6.2 tetap berlaku. Temuan BARU dari deep-dive audit ini
-diverifikasi EMPIRIS (dijalankan langsung dengan library `ta` sungguhan,
-bukan asumsi dari dokumentasi/ingatan) sebelum diperbaiki:
+FITUR BARU v6.4:
+  Menu mode di sidebar: "🚀 Screener Massal" (perilaku v6.3, tidak berubah)
+  vs "🔍 Analisa Manual" — input ticker bebas (BOLEH di luar emiten.csv),
+  dapat trading plan lengkap yang sama seperti modal Action Panel.
 
-■ CRITICAL — [ARCH] UI kolaps ke landing page saat klik apapun
-  Sebelumnya: `if not run_btn: return` menggerbang SELURUH hasil di
-  belakang tombol sidebar. st.button() di Streamlit HANYA True pada
-  render tepat setelah diklik — begitu user klik tombol ticker di Action
-  Panel (tombol LAIN), rerun terjadi, run_btn kembali False, main()
-  langsung return ke landing page SEBELUM sempat memanggil show_modal().
-  Efek: modal tidak pernah terbuka, dan mengubah filter/klik CSV
-  download juga membuat seluruh hasil lenyap.
-  FIX: hasil pipeline disimpan di st.session_state['ifh_run'] dan
-  RENDERING dipisah total dari status run_btn — render selalu baca dari
-  session_state, run_btn hanya trigger fetch+screen sekali.
+  Perbedaan penting dari mode massal: gate wajib (harga di atas present
+  cloud Ichimoku + Heikin Ashi hijau) di-BYPASS di mode manual, karena
+  tujuannya memang mengecek saham APAPUN — termasuk yang sedang bearish
+  atau sudah dipegang user — bukan cuma kandidat yang lolos filter.
+  Supaya tidak menyesatkan: jika gate itu gagal, signal DIPAKSA maksimal
+  WATCH (tidak pernah tampil BUY/STRONG BUY) dan alasan gagalnya
+  ditampilkan eksplisit di baris pertama, konsisten antara modal
+  Screener Massal dan halaman Analisa Manual (satu fungsi render yang
+  sama dipakai keduanya — render_analysis_content()).
 
-■ CRITICAL — [ALGO] Ichimoku cloud salah timing (diverifikasi empiris)
-  Diuji langsung: ta.trend.IchimokuIndicator(visual=False, DEFAULT)
-  TIDAK melakukan shift apapun secara internal (dibuktikan dengan
-  membandingkan output-nya byte-per-byte terhadap rolling-window manual
-  tanpa shift — hasilnya IDENTIK, diff=0.0). Klaim di v6.1/v6.2 bahwa
-  "ta library sudah shift(26) internal" TERBUKTI SALAH.
-  Akibatnya: ichimoku_a()/b() pada bar T = nilai yang MESTINYA diplot
-  26 bar KE DEPAN (T+26) pada chart standar, BUKAN cloud yang terlihat
-  hari ini. Gate "above_cloud" di v6.1/v6.2 membandingkan harga hari
-  ini dengan cloud yang salah 26 bar → mempengaruhi SEMUA sinyal.
-  FIX: Ichimoku dihitung manual (Tenkan/Kijun/Senkou raw), lalu Senkou
-  A/B di-shift(+26) untuk mendapat present cloud yang benar — sesuai
-  konvensi charting Ichimoku standar (leading span diplot 26 bar ke
-  depan saat dihitung, sehingga utk melihat cloud HARI INI perlu nilai
-  yang dihitung 26 bar LALU).
+  screen_one() menerima parameter baru require_gate (default True, jadi
+  SELURUH logika & hasil Screener Massal v6.3 TIDAK berubah sama sekali).
 
-■ MAJOR — [ALGO] find_swing() bisa mengukur leg yang salah arah
-  Diuji dengan data sintetis pola naik-puncak-turun-naik-lagi: versi
-  lama menangkap swing LOW dari PULLBACK SETELAH puncak (bukan swing
-  low SEBELUM puncak) → mengukur down-leg, bukan up-leg yang sedang
-  di-retrace. Fibonacci entry/target/SL jadi salah total (range 32 vs
-  71.7 di test — beda >2x).
-  FIX: cari swing high = puncak tertinggi di window, lalu swing low =
-  titik terendah SEBELUM puncak itu (awal dari impulse leg yang benar).
-
-■ MAJOR — [ALGO] Stop-loss bisa terlalu ketat (whipsaw-prone)
-  max(kijun, fib618, price*0.92) bisa menghasilkan SL <1% dari harga
-  jika kijun kebetulan nempel dekat harga → posisi pasti kena stop oleh
-  noise harian normal, dan position sizing jadi absurd besar karena
-  risk-per-share dihitung terlalu kecil.
-  FIX: SL wajib berjarak minimal ~1.2×ATR dari harga, dengan technical
-  level (Kijun/Fib618) tetap jadi preferensi utama SELAMA jaraknya
-  sudah cukup jauh.
-
-■ MAJOR — [RISK] Position sizing tanpa batas eksposur
-  Sizing murni berbasis risk 1% — jika SL sangat ketat, formula bisa
-  merekomendasikan alokasi >50% modal ke satu saham (over-concentration).
-  FIX: tambah cap eksposur maksimal 25% dari modal per posisi.
-
-■ MAJOR — [DATA INTEGRITY] _batch_chunk() edge-case cross-contamination
-  Jika yf.download() untuk >1 ticker TIDAK BERBENTUK MultiIndex (kasus
-  langka tapi nyata), kode lama meng-copy SATU dataframe yang sama ke
-  SEMUA ticker dalam chunk itu → salah atribusi harga secara diam-diam.
-  FIX: kondisi ini sekarang dianggap gagal (raise → fallback individual
-  per ticker), bukan dipercaya begitu saja.
-
-■ MINOR/PERF:
-  - rs_score() dulu hitung ulang ihsg_close.pct_change() di SETIAP dari
-    953 ticker → sekarang dihitung SEKALI, di-pass sebagai parameter.
-  - market_regime() dulu dipanggil dengan dict kosong sbg workaround
-    (breadth hasil fungsi dibuang, dihitung ulang manual di luar) →
-    dipecah jadi ihsg_trend() + decide_regime() yang jelas & sekali pakai.
-  - Lookback Fibonacci adaptif dulu nyaris SELALU jatuh ke floor 60
-    untuk rentang ATR% realistis saham IDX (1-4%) → diverifikasi
-    numerik, diskalakan ulang agar benar-benar adaptif (60-150).
-  - Chikou Span ditambahkan sebagai poin skor Ichimoku ke-5 (MX 14→15)
-    dan sebagai referensi visual di chart — sebelumnya sama sekali
-    tidak ada padahal ini komponen inti Ichimoku.
-  - Validitas cloud pakai pd.isna() eksplisit, bukan sentinel -1 ala
-    ta-library fillna (yang sudah tidak relevan sejak Ichimoku manual).
-
-WARISAN FIX v6.1/v6.2 (tetap berlaku):
-  Download: yf.Ticker().history() flat columns, batch chunk, retry+jitter
-  HA rekursif benar · RSI Wilder's EMA · True StochRSI
-  Fibo Extension 127.2/161.8% · R/R gate · ADX+DI scoring · MACD fresh cross
-  ADV-Rp · Position sizing · CQS fillna doji · sektor mapping eksplisit
+Semua fix v6.1/v6.2/v6.3 tetap berlaku tanpa perubahan (lihat changelog
+versi sebelumnya di riwayat git / percakapan): Ichimoku shift terverifikasi
+empiris, session_state architecture fix, find_swing peak-then-prior-low,
+stop-loss ATR-minimum, position sizing exposure cap, RSI Wilder's EMA,
+HA rekursif, dsb.
 """
+
 
 from __future__ import annotations
 
@@ -106,7 +48,7 @@ from ta.volatility import AverageTrueRange
 # PAGE CONFIG — wajib paling atas sebelum st lain
 # ═══════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="IFH Pro v6.3",
+    page_title="IFH Pro v6.4",
     layout="wide",
     initial_sidebar_state="expanded",
     page_icon="🦅",
@@ -191,6 +133,7 @@ class SR:
     trend_bars: int   = 0
     cqs:        float = 0.0
     chikou_bull: bool = False
+    gate_passed: bool = True   # False jika lolos via require_gate=False (mode Analisa Manual)
     sektor:     str   = "—"
     lot:        int   = 0
     posisi_rp:  float = 0.0   # nilai eksposur (Rp) pada sizing yang direkomendasikan
@@ -646,11 +589,22 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
                min_adv_rp: float, sektor: str = "—",
                modal_rp: float = 100_000_000,
                risk_pct: float = 0.01,
-               max_exposure_pct: float = 0.25) -> Optional[SR]:
+               max_exposure_pct: float = 0.25,
+               require_gate: bool = True) -> Optional[SR]:
     """
     Analisis teknikal satu ticker. Scoring max = 15 poin:
       Ichimoku (5, termasuk Chikou) + ADX/Trend (3) + Momentum (4)
       + Volume (2) + RS (1)
+
+    require_gate=True  (default, dipakai Screener Massal — TIDAK berubah
+                        dari v6.3): jika harga di bawah cloud atau HA
+                        merah atau ADV di bawah min_adv_rp → return None.
+    require_gate=False (dipakai mode Analisa Manual): gate di atas TIDAK
+                        menggugurkan hasil — semua saham selalu dianalisis
+                        penuh. Tapi supaya tidak menyesatkan, jika gate
+                        gagal, signal dipaksa maksimal WATCH (tidak
+                        pernah BUY/STRONG BUY) dan alasannya ditulis
+                        eksplisit di baris pertama reasons.
     """
     ind = compute_indicators(df_raw)
     if ind is None:
@@ -661,7 +615,9 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
         return None
 
     adv_rp_v = float(ind["adv_rp"].iloc[-1])
-    if np.isnan(adv_rp_v) or adv_rp_v < min_adv_rp:
+    if np.isnan(adv_rp_v):
+        return None   # data benar-benar tidak ada, bukan soal threshold
+    if require_gate and adv_rp_v < min_adv_rp:
         return None
 
     atr_v   = float(ind["atr"].iloc[-1])
@@ -697,8 +653,9 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
 
     kumo_top    = max(sa_v, sb_v)
     above_cloud = price > kumo_top
+    gate_passed = above_cloud and ha_bull
 
-    if not above_cloud or not ha_bull:
+    if require_gate and not gate_passed:
         return None
 
     # Chikou confirmation: close hari ini > close 26 bar lalu
@@ -721,6 +678,20 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
     score = 0
     MX    = 15
     reasons: list = []
+
+    # Jika dianalisis via mode Analisa Manual (require_gate=False) dan gate
+    # utama gagal, catat eksplisit di baris PALING ATAS supaya user paham
+    # kenapa ini bukan sinyal beli aktif — meski tetap dapat analisis penuh.
+    if not gate_passed:
+        if not above_cloud:
+            reasons.append("🔴 GATE UTAMA GAGAL: harga di BAWAH awan Ichimoku — bukan setup bullish yang valid")
+        if not ha_bull:
+            reasons.append("🔴 GATE UTAMA GAGAL: Heikin Ashi MERAH — momentum turun, bukan setup bullish yang valid")
+
+    # Peringatan likuiditas informasional (tidak memengaruhi skor) — relevan
+    # terutama di mode Analisa Manual dimana min_adv_rp tidak digerbang.
+    if adv_rp_v < 500:
+        reasons.append(f"⚠️ Likuiditas SANGAT RENDAH (ADV Rp{adv_rp_v:,.0f}jt/hari) — risiko slippage tinggi")
 
     # A. ICHIMOKU (max 5)
     if sa_v > sb_v:
@@ -848,6 +819,13 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
     conf   = _conf(score, MX)
     signal = _signal(score, MX, rr, adx_v)
 
+    # FIX konsistensi: kalau gate utama gagal (hanya bisa terjadi saat
+    # require_gate=False, mode Analisa Manual), signal TIDAK BOLEH tampil
+    # sebagai BUY/STRONG BUY — itu akan kontradiksi dengan gate wajib yang
+    # dipakai Screener Massal. Turunkan paksa ke maksimal WATCH.
+    if not gate_passed and signal in ("STRONG BUY", "BUY"):
+        signal = "WATCH"
+
     # ── POSITION SIZING: risk-based DENGAN cap eksposur maksimal ──
     risk_rp     = modal_rp * risk_pct
     risk_per_sh = abs(price - stop_loss)
@@ -864,7 +842,8 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
         atr=atr_v, atr_pct=atr_pct, adv_rp=adv_rp_v,
         vol_rel=vol_r, rs=rs_v, adx=adx_v,
         trend_bars=trend_bars, cqs=float(ind["cqs"].iloc[-1]),
-        chikou_bull=chikou_bull, sektor=sektor, lot=lot, posisi_rp=posisi_rp,
+        chikou_bull=chikou_bull, gate_passed=gate_passed,
+        sektor=sektor, lot=lot, posisi_rp=posisi_rp,
         _ind=ind,
     )
 
@@ -1026,9 +1005,25 @@ def results_to_df(results_with_sig: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@st.dialog("📊 Trading Plan Detail", width="large")
-def show_modal(res: SR, df_raw: pd.DataFrame):
+def render_analysis_content(res: SR, df_raw: pd.DataFrame):
+    """
+    Konten analisis lengkap (chart + metrics + reasons + action plan).
+    Dipakai BERSAMA oleh show_modal() (Screener Massal) dan
+    render_manual_analysis() (Analisa Manual) — satu sumber kebenaran,
+    supaya perilaku & tampilan selalu konsisten di kedua mode.
+    """
     sc = SIG_COLOR.get(res.signal, "#FAFAFA")
+
+    if not res.gate_passed:
+        st.warning(
+            "⚠️ **Saham ini TIDAK memenuhi gate teknikal wajib** "
+            "(harga di atas awan Ichimoku + Heikin Ashi hijau). "
+            "Analisis di bawah tetap dihitung penuh untuk referensi, tapi "
+            "**bukan sinyal beli aktif** — level entry/target/SL bersifat "
+            "proyeksi hipotetis 'jika trend berbalik', bukan rekomendasi "
+            "entry sekarang."
+        )
+
     st.markdown(
         f"<h3 style='margin:0;'>{res.ticker} &nbsp;"
         f"<span style='color:{sc};font-size:.95rem;'>{res.signal}</span></h3>"
@@ -1041,7 +1036,7 @@ def show_modal(res: SR, df_raw: pd.DataFrame):
     )
 
     fig = build_chart(res.ticker, df_raw, res)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Harga", f"{res.harga:,.0f}")
@@ -1099,11 +1094,16 @@ def show_modal(res: SR, df_raw: pd.DataFrame):
             st.warning(f"⚠️ Underperform IHSG (RS {res.rs:+.2f})")
 
 
+@st.dialog("📊 Trading Plan Detail", width="large")
+def show_modal(res: SR, df_raw: pd.DataFrame):
+    render_analysis_content(res, df_raw)
+
+
 def show_landing_page():
     st.markdown("""
 ### 👆 Klik **Jalankan Screener** di sidebar untuk memulai.
 
-**Metodologi v6.3:**
+**Metodologi v6.4:**
 | Komponen | Poin | Detail |
 |---|---|---|
 | Ichimoku | 5 | Cloud color, TK cross, Kijun support, Kijun slope, **Chikou confirm** |
@@ -1119,7 +1119,7 @@ def show_landing_page():
 - ✅ R/R ≥ min R/R sidebar (default 1.5:1)
 - ✅ ADV-Rp ≥ threshold likuiditas sidebar
 
-**Temuan & fix utama deep-dive v6.3:**
+**Temuan & fix utama deep-dive v6.3** *(tetap berlaku di v6.4)*:
 - 🔧 **[Kritis]** UI tidak lagi kolaps ke landing page saat klik ticker/filter — hasil disimpan di session_state
 - 🔧 **[Kritis]** Ichimoku cloud: shift(26) diverifikasi EMPIRIS langsung terhadap library `ta` (bukan asumsi)
 - 🔧 find_swing(): swing high (puncak) → swing low SEBELUM puncak (bukan pivot independen)
@@ -1127,7 +1127,105 @@ def show_landing_page():
 - 🔧 Position sizing: tambah cap eksposur 25% modal (hindari over-concentration)
 - 🔧 Lookback Fibonacci adaptif diskalakan ulang (terbukti numerik lama selalu floor 60)
 - 🔧 Chikou Span ditambahkan sebagai konfirmasi + referensi chart
+
+**Baru di v6.4:** mode **🔍 Analisa Manual** di sidebar — cek satu ticker
+spesifik (bebas, tidak harus ada di emiten.csv), gate wajib tidak
+digerbang, tapi signal BUY/STRONG BUY tetap ditahan ke maksimal WATCH
+jika gate teknikal gagal (supaya tidak kontradiksi dengan Screener Massal).
     """)
+
+
+def render_manual_analysis(sek_map: dict, modal_rp: float, risk_pct: float, max_expo: float):
+    """
+    Mode 'Analisa Manual' — input ticker bebas, dapat trading plan lengkap
+    yang sama seperti modal Action Panel Screener Massal, TANPA perlu
+    ticker itu lolos gate wajib maupun ada di emiten.csv.
+
+    Hasil disimpan di st.session_state (namespace 'manual_*', terpisah
+    dari 'ifh_run' milik Screener Massal) — konsisten dengan pola fix
+    arsitektur v6.3: render selalu baca dari session_state, bukan dari
+    status tombol yang ephemeral, supaya interaksi lain (mis. pindah tab)
+    tidak menghilangkan hasil analisis yang sudah didapat.
+    """
+    st.markdown("### 🔍 Analisa Manual — Cek Saham Spesifik")
+    st.markdown(
+        "<p style='color:#848E9C;'>Masukkan kode ticker APAPUN — tidak harus ada di "
+        "daftar emiten.csv. Gate wajib (di atas awan + HA hijau) <b>tidak digerbang</b> "
+        "di sini, jadi kamu bisa cek saham yang sedang bearish atau yang sudah kamu pegang.</p>",
+        unsafe_allow_html=True,
+    )
+
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        ticker_raw = st.text_input(
+            "Kode Ticker", placeholder="Contoh: BBCA, TLKM, BREN, atau BBCA.JK",
+            key="manual_ticker_input", label_visibility="collapsed",
+        )
+    with col2:
+        analyze_btn = st.button("🔎 Analisa", width='stretch', type="primary")
+
+    # Quick-pick beberapa ticker populer dari emiten.csv (kalau ada)
+    quick_picks = list(sek_map.keys())[:8]
+    if quick_picks:
+        st.markdown(
+            "<span style='color:#848E9C;font-size:.78rem;'>Cepat pilih:</span>",
+            unsafe_allow_html=True,
+        )
+        qcols = st.columns(len(quick_picks))
+        for i, qt in enumerate(quick_picks):
+            with qcols[i]:
+                if st.button(qt.replace(".JK", ""), key=f"quickpick_{qt}", width='stretch'):
+                    st.session_state["manual_ticker_input"] = qt.replace(".JK", "")
+                    ticker_raw = qt.replace(".JK", "")
+                    analyze_btn = True
+
+    if analyze_btn and ticker_raw and ticker_raw.strip():
+        ticker = ticker_raw.strip().upper()
+        if not ticker.endswith(".JK"):
+            ticker += ".JK"
+
+        with st.spinner(f"📡 Mengunduh & menganalisis {ticker}..."):
+            df = _safe_download(ticker, PERIOD)
+
+            if df is None:
+                st.session_state["manual_result"] = None
+                st.session_state["manual_error"] = (
+                    f"❌ Data untuk **{ticker}** tidak ditemukan atau tidak cukup "
+                    f"(minimal {MIN_BARS} hari trading). Cek kembali kode ticker-nya "
+                    f"— pastikan ini kode saham IDX yang valid."
+                )
+            else:
+                ihsg_df    = fetch_ihsg()
+                ihsg_close = ihsg_df["Close"].squeeze() if not ihsg_df.empty else None
+                ihsg_ret   = ihsg_close.pct_change() if ihsg_close is not None else None
+                sektor     = sek_map.get(ticker, "—")
+
+                r = screen_one(
+                    ticker, df, ihsg_ret, min_adv_rp=0, sektor=sektor,
+                    modal_rp=modal_rp, risk_pct=risk_pct, max_exposure_pct=max_expo,
+                    require_gate=False,   # FIX inti fitur: jangan gerbang di mode manual
+                )
+                if r is None:
+                    st.session_state["manual_result"] = None
+                    st.session_state["manual_error"] = (
+                        f"❌ Data **{ticker}** tidak cukup untuk dianalisis "
+                        f"(kemungkinan data harga tidak lengkap)."
+                    )
+                else:
+                    st.session_state["manual_result"] = r
+                    st.session_state["manual_df"]     = df
+                    st.session_state["manual_error"]  = None
+
+    # ── Render selalu dari session_state (pola sama seperti fix v6.3) ──
+    if st.session_state.get("manual_error"):
+        st.error(st.session_state["manual_error"])
+
+    res = st.session_state.get("manual_result")
+    if res is not None:
+        st.markdown("---")
+        render_analysis_content(res, st.session_state["manual_df"])
+    elif not st.session_state.get("manual_error"):
+        st.info("💡 Masukkan kode ticker di atas dan klik **Analisa** untuk memulai.")
 
 
 # ═══════════════════════════════════════════════════════
@@ -1135,7 +1233,7 @@ def show_landing_page():
 # ═══════════════════════════════════════════════════════
 def main():
     st.markdown(
-        "<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v6.3</h1>",
+        "<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v6.4</h1>",
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -1156,43 +1254,72 @@ def main():
     with st.sidebar:
         st.markdown("## ⚙️ Konfigurasi")
 
-        n_tickers = st.slider("Jumlah emiten (Top N)", 10, len(all_tickers),
-                              min(200, len(all_tickers)), 10)
-        min_adv_rp = st.slider(
-            "Min Likuiditas (Rp juta/hari)", 500, 20_000, 2_000, 500,
-            help="ADV-Rp: Average Daily Value dalam juta rupiah. 2000 = Rp2 miliar/hari.",
+        mode = st.radio(
+            "Mode", ["🚀 Screener Massal", "🔍 Analisa Manual"],
+            key="app_mode",
+            help="Screener Massal: scan banyak saham sekaligus, wajib lolos gate teknikal. "
+                 "Analisa Manual: cek satu ticker spesifik, gate tidak wajib.",
         )
-        min_rr = st.slider(
-            "Min R/R Ratio", 1.0, 4.0, 1.5, 0.5,
-            help="Bisa diubah kapan saja SETELAH screening — sinyal AVOID/BUY "
-                 "dihitung ulang otomatis dari hasil yang sudah ada, tanpa perlu "
-                 "download ulang.",
-        )
-        workers = st.slider("Parallel workers", 2, 12, 6, 1,
-                            help="Thread paralel untuk download & analisis. Default 6 aman.")
-        chunk = st.slider("Ticker per request (chunk)", 5, 50, CHUNK_SIZE, 5,
-                          help="Chunk 20: 953 ticker → 48 request.")
-
         st.markdown("---")
+
+        if mode == "🚀 Screener Massal":
+            n_tickers = st.slider("Jumlah emiten (Top N)", 10, len(all_tickers),
+                                  min(200, len(all_tickers)), 10)
+            min_adv_rp = st.slider(
+                "Min Likuiditas (Rp juta/hari)", 500, 20_000, 2_000, 500,
+                help="ADV-Rp: Average Daily Value dalam juta rupiah. 2000 = Rp2 miliar/hari.",
+            )
+            min_rr = st.slider(
+                "Min R/R Ratio", 1.0, 4.0, 1.5, 0.5,
+                help="Bisa diubah kapan saja SETELAH screening — sinyal AVOID/BUY "
+                     "dihitung ulang otomatis dari hasil yang sudah ada, tanpa perlu "
+                     "download ulang.",
+            )
+            workers = st.slider("Parallel workers", 2, 12, 6, 1,
+                                help="Thread paralel untuk download & analisis. Default 6 aman.")
+            chunk = st.slider("Ticker per request (chunk)", 5, 50, CHUNK_SIZE, 5,
+                              help="Chunk 20: 953 ticker → 48 request.")
+            st.markdown("---")
+        else:
+            st.caption(
+                "🔍 **Mode Analisa Manual** — masukkan ticker di halaman utama. "
+                "Gate teknikal (di atas awan + HA hijau) TIDAK wajib di sini, jadi "
+                "kamu bisa cek saham apapun, termasuk yang sedang bearish atau yang "
+                "sudah kamu pegang."
+            )
+            st.markdown("---")
+
         st.markdown("**Position Sizing**")
         modal_rp = st.number_input("Modal (Rp)", value=100_000_000, step=10_000_000,
                                    format="%d")
         risk_pct = st.slider("Risk per trade (%)", 0.5, 3.0, 1.0, 0.5) / 100
         max_expo = st.slider("Max eksposur per saham (%)", 10, 50, 25, 5) / 100
 
-        st.markdown("---")
-        st.markdown("**Filter Tampilan**")
-        show_sigs = st.multiselect("Tampilkan sinyal:", SIGNAL_ORDER,
-                                   default=["STRONG BUY", "BUY", "WATCH"])
+        if mode == "🚀 Screener Massal":
+            st.markdown("---")
+            st.markdown("**Filter Tampilan**")
+            show_sigs = st.multiselect("Tampilkan sinyal:", SIGNAL_ORDER,
+                                       default=["STRONG BUY", "BUY", "WATCH"])
 
         st.markdown("---")
         st.markdown(
             f"<span style='color:#848E9C;font-size:.78rem;'>"
-            f"v6.3 · {len(all_tickers)} emiten loaded · "
-            f"chunk={chunk} · {workers} workers</span>",
+            f"v6.4 · {len(all_tickers)} emiten loaded</span>",
             unsafe_allow_html=True,
         )
-        run_btn = st.button("🚀 Jalankan Screener", use_container_width=True, type="primary")
+
+        if mode == "🚀 Screener Massal":
+            run_btn = st.button("🚀 Jalankan Screener", width='stretch', type="primary")
+        else:
+            run_btn = False
+
+    # ══════════════════════════════════════════════════
+    # BRANCH: Analisa Manual dirender terpisah, TIDAK menyentuh
+    # pipeline/session_state milik Screener Massal sama sekali.
+    # ══════════════════════════════════════════════════
+    if mode == "🔍 Analisa Manual":
+        render_manual_analysis(sek_map, modal_rp, risk_pct, max_expo)
+        return
 
     # ══════════════════════════════════════════════════
     # PIPELINE — HANYA jalan saat run_btn diklik.
@@ -1317,7 +1444,7 @@ def main():
 
     df_disp = results_to_df(filtered)
     st.dataframe(
-        df_disp, use_container_width=True, hide_index=True,
+        df_disp, width='stretch', hide_index=True,
         column_config={
             "Signal":     st.column_config.TextColumn(width=110),
             "Lot Sizing": st.column_config.NumberColumn(format="%d"),
@@ -1347,7 +1474,7 @@ def main():
                         if st.button(
                             f"**{r.ticker}**\n{r.score}/{r.score_max} · R/R {r.rr:.1f}",
                             key=f"btn_{r.ticker}_{sig}",
-                            use_container_width=True,
+                            width='stretch',
                             help=(f"{r.conf} | ADX {r.adx:.0f} | Vol {r.vol_rel:.1f}× | "
                                  f"RS {r.rs:+.2f} | ADV Rp{r.adv_rp:,.0f}jt"),
                         ):
