@@ -1,40 +1,32 @@
 """
-Screener Ichi-Fibo-Heikin Pro  •  v6.5  (MA200 context + Peta Breakdown)
+Screener Ichi-Fibo-Heikin Pro  •  v6.6  (Kalkulator Average Down)
 ════════════════════════════════════════════════════════════════════
-FITUR BARU v6.5 (menjawab pertanyaan: "narik fibo auto-detect atau ada
-aturan khusus? gimana kalau saham jatuh di bawah MA200?"):
+FITUR BARU v6.6:
+  "💰 Kalkulator Average Down" — expander opt-in di render_analysis_content(),
+  jadi otomatis tersedia di KEDUA tempat (modal Action Panel Screener
+  Massal, DAN halaman Analisa Manual) — termasuk utk saham yang TIDAK
+  lolos gate teknikal (fib_mode="bearish"), sesuai permintaan: "scan
+  manual atau meskipun saham itu tidak lolos skrining".
 
-  [1] MA200 sbg KONTEKS/WARNING informasional (TIDAK memengaruhi skor,
-      TIDAK jadi gate). Independen dari gate Ichimoku — saham bisa
-      gate_passed=True (setup jangka pendek bullish) TAPI masih di
-      bawah MA200 (gambaran jangka panjang masih bearish), atau
-      sebaliknya. Ditampilkan sbg reason + badge di header + garis di
-      chart. PERIOD dinaikkan dari "1y" ke "2y" (~500 bar) supaya MA200
-      (butuh 200 bar) selalu punya buffer aman — kalau history masih
-      <200 bar, ditangani graceful ("belum tersedia"), tidak crash.
+  Input: lot yang sudah dipegang + harga rata-rata beli (user isi sendiri,
+  bukan dari data — average price historis user tidak ada di data pasar).
+  Output: floating P/L saat ini, average price baru & breakeven % kalau
+  nambah N lot di harga sekarang (slider interaktif), potensi return ke
+  Target 1 (mode bullish) atau ke zona Resistance (mode bearish), cross-
+  check total eksposur terhadap batas % modal yang di-set di sidebar
+  (Position Sizing), dan catatan kontekstual dari gate_passed/fib_mode
+  (TIDAK memaksakan rekomendasi "harus/jangan" — murni kalkulator +
+  konteks, keputusan tetap di tangan user, sesuai <legal_and_financial_advice>).
 
-  [2] Mode Fibonacci BEARISH — "Peta Breakdown" (find_swing_bearish +
-      fib_levels_bearish), MIRROR dari mode bullish yang sudah ada:
-      - Bullish (default, satu-satunya yg dipakai Screener Massal
-        karena require_gate=True selalu reject duluan kalau gate
-        gagal): swing low→high, entry di retracement, target ekstensi
-        ke ATAS. Logika 100% SAMA seperti v6.4, tidak berubah.
-      - Bearish (HANYA tercapai di Analisa Manual saat gate_passed=
-        False): swing high→low, level DIREINTERPRETASI jadi zona
-        RESISTANCE (bukan entry), level INVALIDASI breakdown (bukan
-        stop-loss beli), proyeksi DOWNSIDE (bukan target profit).
-        Framing sengaja "peta risiko", BUKAN sinyal short — trading
-        short tidak umum tersedia utk retail IDX.
-      screen_one() otomatis pilih mode berdasarkan gate_passed; field
-      SR yang sama (entry_hi/lo, target1/2, stop_loss) direuse dgn
-      makna berbeda, dibedakan lewat SR.fib_mode ("bullish"/"bearish").
-      render_analysis_content() & build_chart() branch label/warna
-      sesuai fib_mode supaya tidak membingungkan.
+  render_analysis_content()/show_modal() sekarang menerima modal_rp &
+  max_expo (sudah ada di sidebar Position Sizing sejak v6.4/v6.5, kini
+  di-thread ke modal juga, sebelumnya cuma dipakai di screen_one()).
 
-Semua fix v6.1–v6.4 tetap berlaku tanpa perubahan: Ichimoku shift
+Semua fix v6.1–v6.5 tetap berlaku tanpa perubahan: Ichimoku shift
 terverifikasi empiris, session_state architecture fix, find_swing
 peak-then-prior-low, stop-loss ATR-minimum, position sizing exposure
-cap, RSI Wilder's EMA, HA rekursif, mode Analisa Manual, dsb.
+cap, RSI Wilder's EMA, HA rekursif, mode Analisa Manual, MA200 context,
+Peta Breakdown (Fibo bearish), dsb.
 """
 
 
@@ -59,7 +51,7 @@ from ta.volatility import AverageTrueRange
 # PAGE CONFIG — wajib paling atas sebelum st lain
 # ═══════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="IFH Pro v6.5",
+    page_title="IFH Pro v6.6",
     layout="wide",
     initial_sidebar_state="expanded",
     page_icon="🦅",
@@ -1140,12 +1132,13 @@ def results_to_df(results_with_sig: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def render_analysis_content(res: SR, df_raw: pd.DataFrame):
+def render_analysis_content(res: SR, df_raw: pd.DataFrame,
+                            modal_rp: float = 100_000_000, max_expo: float = 0.25):
     """
-    Konten analisis lengkap (chart + metrics + reasons + action plan).
-    Dipakai BERSAMA oleh show_modal() (Screener Massal) dan
-    render_manual_analysis() (Analisa Manual) — satu sumber kebenaran,
-    supaya perilaku & tampilan selalu konsisten di kedua mode.
+    Konten analisis lengkap (chart + metrics + reasons + action plan +
+    kalkulator average down). Dipakai BERSAMA oleh show_modal() (Screener
+    Massal) dan render_manual_analysis() (Analisa Manual) — satu sumber
+    kebenaran, supaya perilaku & tampilan selalu konsisten di kedua mode.
 
     Label & wording metric/action-plan BERBEDA tergantung res.fib_mode:
     - "bullish" (default, satu-satunya mode yg dipakai Screener Massal):
@@ -1285,17 +1278,128 @@ def render_analysis_content(res: SR, df_raw: pd.DataFrame):
         elif res.rs < -0.5:
             st.warning(f"⚠️ Underperform IHSG (RS {res.rs:+.2f})")
 
+    # ══════════════════════════════════════════════════
+    # KALKULATOR AVERAGE DOWN — opt-in (expander), berlaku utk saham
+    # APAPUN (lolos gate atau tidak, Screener Massal atau Analisa Manual).
+    # Ini kalkulator angka, BUKAN rekomendasi "harus/jangan average down"
+    # — keputusan tetap di tangan user, tapi konteks teknikal (gate_passed,
+    # fib_mode, level invalidasi/target) ditampilkan supaya keputusan itu
+    # terinformasi.
+    # ══════════════════════════════════════════════════
+    st.markdown("---")
+    with st.expander("💰 Kalkulator Average Down (kalau kamu sudah pegang saham ini)"):
+        st.caption(
+            "Isi posisi yang sudah kamu pegang, lihat average price baru & "
+            "breakeven kalau nambah di harga sekarang. Ini murni kalkulator "
+            "angka — keputusan nambah atau tidak tetap di tangan kamu."
+        )
+
+        c1, c2 = st.columns(2)
+        existing_lot = c1.number_input(
+            "Lot yang sudah dipegang", min_value=1, value=10, step=1,
+            key=f"ad_lot_{res.ticker}",
+        )
+        existing_avg = c2.number_input(
+            "Harga rata-rata beli (Rp)", min_value=1.0,
+            value=float(round(res.harga * 1.1, 0)), step=1.0,
+            key=f"ad_avg_{res.ticker}",
+        )
+
+        unrealized_pct = (res.harga - existing_avg) / existing_avg * 100
+        unrealized_rp  = (res.harga - existing_avg) * existing_lot * 100
+        pl_color = "normal" if unrealized_pct >= 0 else "inverse"
+        st.metric("Floating P/L saat ini", f"{unrealized_pct:+.1f}%",
+                  f"Rp{unrealized_rp:+,.0f}", delta_color=pl_color)
+
+        # FIX: batas slider sebelumnya cuma existing_lot*3 — kalau existing_lot
+        # kecil (mis. 1 lot), range jadi cuma 0-20, nggak cukup buat simulasi
+        # nambah banyak. Sekarang ikut mempertimbangkan berapa lot yang bisa
+        # dibeli dari modal yang di-configure di sidebar, supaya range slider
+        # tetap masuk akal berapa pun ukuran posisi awal.
+        max_by_modal = int(modal_rp / (100 * res.harga)) if res.harga > 0 else 20
+        max_tambah   = max(existing_lot * 3, max_by_modal, 20)
+        tambah_lot = st.slider(
+            "Mau nambah berapa lot di harga sekarang?", 0, int(max_tambah),
+            value=int(existing_lot), key=f"ad_add_{res.ticker}",
+        )
+
+        if tambah_lot > 0:
+            new_avg = (existing_lot * existing_avg + tambah_lot * res.harga) / (existing_lot + tambah_lot)
+            breakeven_pct  = (new_avg / res.harga - 1) * 100
+            modal_tambahan = tambah_lot * 100 * res.harga
+
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Average baru", f"{new_avg:,.0f}",
+                      f"{(new_avg/existing_avg-1)*100:+.1f}% dari avg lama")
+            d2.metric("Harga perlu naik", f"{breakeven_pct:+.1f}%",
+                      "buat breakeven dari average baru", delta_color="off")
+            d3.metric("Modal tambahan", f"Rp{modal_tambahan/1_000_000:,.1f}jt")
+
+            # ── Cross-check ke target/resistance teknikal yang sudah dihitung ──
+            if res.fib_mode == "bullish":
+                potensi_t1 = (res.target1 / new_avg - 1) * 100
+                st.caption(
+                    f"📐 Kalau Target 1 ({res.target1:,.0f}) tercapai, potensi return dari "
+                    f"average baru: **{potensi_t1:+.1f}%**"
+                )
+            else:
+                potensi_r = (res.entry_hi / new_avg - 1) * 100
+                st.caption(
+                    f"📐 Kalau harga rally ke zona Resistance ({res.entry_hi:,.0f}), potensi "
+                    f"return dari average baru: **{potensi_r:+.1f}%** — resistance ini belum "
+                    f"tentu tercapai, bukan target pasti."
+                )
+
+            # ── Cross-check eksposur ke config Position Sizing di sidebar ──
+            total_lot   = existing_lot + tambah_lot
+            total_value = total_lot * 100 * res.harga
+            pct_modal   = total_value / modal_rp * 100 if modal_rp > 0 else 0
+            if pct_modal > max_expo * 100:
+                st.warning(
+                    f"⚠️ Total posisi setelah nambah: Rp{total_value/1_000_000:,.1f}jt "
+                    f"= **{pct_modal:.0f}% dari modal** — di atas batas eksposur "
+                    f"{max_expo*100:.0f}% yang kamu set di sidebar. Pertimbangkan kurangi jumlah."
+                )
+            else:
+                st.caption(
+                    f"Total posisi setelah nambah: Rp{total_value/1_000_000:,.1f}jt "
+                    f"({pct_modal:.0f}% dari modal, masih dalam batas {max_expo*100:.0f}%)"
+                )
+
+            # ── Konteks teknikal — bukan rekomendasi, cuma info posisi relatif ──
+            if res.fib_mode == "bearish":
+                jarak_invalidasi = (res.stop_loss / res.harga - 1) * 100
+                st.warning(
+                    f"⚠️ Saham ini belum menunjukkan tanda reversal — level invalidasi "
+                    f"breakdown ({res.stop_loss:,.0f}) masih **{jarak_invalidasi:+.1f}%** di "
+                    f"atas harga sekarang. Average down di kondisi ini menaikkan risiko "
+                    f"konsentrasi di saham yang trend-nya masih turun — pastikan alasanmu "
+                    f"masih valid sebelum nambah."
+                )
+            elif res.gate_passed:
+                st.success(
+                    f"✅ Struktur teknikal saat ini bullish (di atas awan Ichimoku + HA "
+                    f"hijau). Average down di sini lebih dekat ke 'beli pullback dalam "
+                    f"uptrend' — tetap perhatikan stop loss di {res.stop_loss:,.0f}."
+                )
+            else:
+                st.info(
+                    "ℹ️ Gate teknikal belum lolos penuh — cek ulang alasan sinyal di "
+                    "atas sebelum menambah posisi."
+                )
+
 
 @st.dialog("📊 Trading Plan Detail", width="large")
-def show_modal(res: SR, df_raw: pd.DataFrame):
-    render_analysis_content(res, df_raw)
+def show_modal(res: SR, df_raw: pd.DataFrame,
+               modal_rp: float = 100_000_000, max_expo: float = 0.25):
+    render_analysis_content(res, df_raw, modal_rp, max_expo)
 
 
 def show_landing_page():
     st.markdown("""
 ### 👆 Klik **Jalankan Screener** di sidebar untuk memulai.
 
-**Metodologi v6.5:**
+**Metodologi v6.6:**
 | Komponen | Poin | Detail |
 |---|---|---|
 | Ichimoku | 5 | Cloud color, TK cross, Kijun support, Kijun slope, **Chikou confirm** |
@@ -1415,7 +1519,7 @@ def render_manual_analysis(sek_map: dict, modal_rp: float, risk_pct: float, max_
     res = st.session_state.get("manual_result")
     if res is not None:
         st.markdown("---")
-        render_analysis_content(res, st.session_state["manual_df"])
+        render_analysis_content(res, st.session_state["manual_df"], modal_rp, max_expo)
     elif not st.session_state.get("manual_error"):
         st.info("💡 Masukkan kode ticker di atas dan klik **Analisa** untuk memulai.")
 
@@ -1425,7 +1529,7 @@ def render_manual_analysis(sek_map: dict, modal_rp: float, risk_pct: float, max_
 # ═══════════════════════════════════════════════════════
 def main():
     st.markdown(
-        "<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v6.5</h1>",
+        "<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v6.6</h1>",
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -1496,7 +1600,7 @@ def main():
         st.markdown("---")
         st.markdown(
             f"<span style='color:#848E9C;font-size:.78rem;'>"
-            f"v6.5 · {len(all_tickers)} emiten loaded</span>",
+            f"v6.6 · {len(all_tickers)} emiten loaded</span>",
             unsafe_allow_html=True,
         )
 
@@ -1670,7 +1774,7 @@ def main():
                             help=(f"{r.conf} | ADX {r.adx:.0f} | Vol {r.vol_rel:.1f}× | "
                                  f"RS {r.rs:+.2f} | ADV Rp{r.adv_rp:,.0f}jt"),
                         ):
-                            show_modal(r, all_dfs[r.ticker])
+                            show_modal(r, all_dfs[r.ticker], modal_rp, max_expo)
 
 
 if __name__ == "__main__":
