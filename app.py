@@ -1,29 +1,40 @@
 """
-Screener Ichi-Fibo-Heikin Pro  •  v6.4  (+ Analisa Manual)
+Screener Ichi-Fibo-Heikin Pro  •  v6.5  (MA200 context + Peta Breakdown)
 ════════════════════════════════════════════════════════════════════
-FITUR BARU v6.4:
-  Menu mode di sidebar: "🚀 Screener Massal" (perilaku v6.3, tidak berubah)
-  vs "🔍 Analisa Manual" — input ticker bebas (BOLEH di luar emiten.csv),
-  dapat trading plan lengkap yang sama seperti modal Action Panel.
+FITUR BARU v6.5 (menjawab pertanyaan: "narik fibo auto-detect atau ada
+aturan khusus? gimana kalau saham jatuh di bawah MA200?"):
 
-  Perbedaan penting dari mode massal: gate wajib (harga di atas present
-  cloud Ichimoku + Heikin Ashi hijau) di-BYPASS di mode manual, karena
-  tujuannya memang mengecek saham APAPUN — termasuk yang sedang bearish
-  atau sudah dipegang user — bukan cuma kandidat yang lolos filter.
-  Supaya tidak menyesatkan: jika gate itu gagal, signal DIPAKSA maksimal
-  WATCH (tidak pernah tampil BUY/STRONG BUY) dan alasan gagalnya
-  ditampilkan eksplisit di baris pertama, konsisten antara modal
-  Screener Massal dan halaman Analisa Manual (satu fungsi render yang
-  sama dipakai keduanya — render_analysis_content()).
+  [1] MA200 sbg KONTEKS/WARNING informasional (TIDAK memengaruhi skor,
+      TIDAK jadi gate). Independen dari gate Ichimoku — saham bisa
+      gate_passed=True (setup jangka pendek bullish) TAPI masih di
+      bawah MA200 (gambaran jangka panjang masih bearish), atau
+      sebaliknya. Ditampilkan sbg reason + badge di header + garis di
+      chart. PERIOD dinaikkan dari "1y" ke "2y" (~500 bar) supaya MA200
+      (butuh 200 bar) selalu punya buffer aman — kalau history masih
+      <200 bar, ditangani graceful ("belum tersedia"), tidak crash.
 
-  screen_one() menerima parameter baru require_gate (default True, jadi
-  SELURUH logika & hasil Screener Massal v6.3 TIDAK berubah sama sekali).
+  [2] Mode Fibonacci BEARISH — "Peta Breakdown" (find_swing_bearish +
+      fib_levels_bearish), MIRROR dari mode bullish yang sudah ada:
+      - Bullish (default, satu-satunya yg dipakai Screener Massal
+        karena require_gate=True selalu reject duluan kalau gate
+        gagal): swing low→high, entry di retracement, target ekstensi
+        ke ATAS. Logika 100% SAMA seperti v6.4, tidak berubah.
+      - Bearish (HANYA tercapai di Analisa Manual saat gate_passed=
+        False): swing high→low, level DIREINTERPRETASI jadi zona
+        RESISTANCE (bukan entry), level INVALIDASI breakdown (bukan
+        stop-loss beli), proyeksi DOWNSIDE (bukan target profit).
+        Framing sengaja "peta risiko", BUKAN sinyal short — trading
+        short tidak umum tersedia utk retail IDX.
+      screen_one() otomatis pilih mode berdasarkan gate_passed; field
+      SR yang sama (entry_hi/lo, target1/2, stop_loss) direuse dgn
+      makna berbeda, dibedakan lewat SR.fib_mode ("bullish"/"bearish").
+      render_analysis_content() & build_chart() branch label/warna
+      sesuai fib_mode supaya tidak membingungkan.
 
-Semua fix v6.1/v6.2/v6.3 tetap berlaku tanpa perubahan (lihat changelog
-versi sebelumnya di riwayat git / percakapan): Ichimoku shift terverifikasi
-empiris, session_state architecture fix, find_swing peak-then-prior-low,
-stop-loss ATR-minimum, position sizing exposure cap, RSI Wilder's EMA,
-HA rekursif, dsb.
+Semua fix v6.1–v6.4 tetap berlaku tanpa perubahan: Ichimoku shift
+terverifikasi empiris, session_state architecture fix, find_swing
+peak-then-prior-low, stop-loss ATR-minimum, position sizing exposure
+cap, RSI Wilder's EMA, HA rekursif, mode Analisa Manual, dsb.
 """
 
 
@@ -48,7 +59,7 @@ from ta.volatility import AverageTrueRange
 # PAGE CONFIG — wajib paling atas sebelum st lain
 # ═══════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="IFH Pro v6.4",
+    page_title="IFH Pro v6.5",
     layout="wide",
     initial_sidebar_state="expanded",
     page_icon="🦅",
@@ -88,8 +99,8 @@ st.markdown("""
 # KONSTANTA
 # ═══════════════════════════════════════════════════════
 IHSG_TICKER = "^JKSE"
-PERIOD      = "1y"      # ~250 bar
-MIN_BARS    = 90        # Senkou B(52)+shift(26)=78 minimum; 90 beri buffer aman
+PERIOD      = "2y"      # ~500 bar — dinaikkan dari 1y agar MA200 (butuh 200 bar) punya buffer aman
+MIN_BARS    = 90        # minimum utk analisis jalan; MA200 sendiri butuh 200 bar (ditangani terpisah, graceful)
 CHUNK_SIZE  = 20
 MAX_RETRY   = 3
 
@@ -134,6 +145,9 @@ class SR:
     cqs:        float = 0.0
     chikou_bull: bool = False
     gate_passed: bool = True   # False jika lolos via require_gate=False (mode Analisa Manual)
+    ma200:       float = float("nan")           # NaN jika history <200 bar
+    above_ma200: Optional[bool] = None          # None = belum bisa ditentukan (data kurang)
+    fib_mode:    str = "bullish"                # "bullish" (default) atau "bearish" (breakdown map)
     sektor:     str   = "—"
     lot:        int   = 0
     posisi_rp:  float = 0.0   # nilai eksposur (Rp) pada sizing yang direkomendasikan
@@ -427,6 +441,7 @@ def compute_indicators(df_raw: pd.DataFrame) -> Optional[dict]:
     ha    = heikin_ashi(df)
     ema20 = EMAIndicator(c, window=20).ema_indicator()
     ema50 = EMAIndicator(c, window=50).ema_indicator()
+    ma200 = c.rolling(200).mean()   # NaN kalau history <200 bar — ditangani graceful di screen_one
     macd_hist = MACD(c).macd_diff()
 
     adx_obj  = ADXIndicator(h, lo, c, window=14)
@@ -448,7 +463,7 @@ def compute_indicators(df_raw: pd.DataFrame) -> Optional[dict]:
         tenkan=ichi["tenkan"], kijun=ichi["kijun"],
         senkou_a=ichi["senkou_a"], senkou_b=ichi["senkou_b"],
         chikou_chart=ichi["chikou_chart"],
-        ha=ha, ema20=ema20, ema50=ema50,
+        ha=ha, ema20=ema20, ema50=ema50, ma200=ma200,
         macd_hist=macd_hist,
         adx=adx_val, di_plus=di_plus, di_minus=di_minus,
         atr=atr, srsi_k=srsi_k, srsi_d=srsi_d, rsi14=rsi14,
@@ -498,6 +513,57 @@ def fib_levels(sh: float, sl: float) -> dict:
         e1272=sl + 1.272 * d,
         e1618=sl + 1.618 * d,
         e2000=sl + 2.000 * d,
+    )
+
+
+def find_swing_bearish(high: pd.Series, low: pd.Series, lookback: int = 90) -> tuple:
+    """
+    Mirror dari find_swing() untuk konteks BREAKDOWN (saham gagal gate
+    bullish — di bawah awan / HA merah). Dipakai HANYA di mode Analisa
+    Manual (require_gate=False); Screener Massal tidak pernah sampai ke
+    fungsi ini karena sudah di-reject duluan oleh gate.
+
+    Swing low  = titik TERENDAH dalam window (dasar dari down-leg).
+    Swing high = titik TERTINGGI SEBELUM low itu (puncak sebelum longsor,
+                 titik awal dari down-leg yang sedang diukur).
+    """
+    n  = min(lookback, len(high))
+    hw = high.iloc[-n:].reset_index(drop=True)
+    lw = low.iloc[-n:].reset_index(drop=True)
+
+    sl_pos = int(lw.values.argmin())
+    sl     = float(lw.iloc[sl_pos])
+
+    if sl_pos > 0:
+        sh = float(hw.iloc[: sl_pos + 1].max())
+    else:
+        sh = float(hw.max())
+
+    if sh <= sl:
+        sh, sl = float(hw.max()), float(lw.min())
+    return sh, sl
+
+
+def fib_levels_bearish(sh: float, sl: float) -> dict:
+    """
+    Level Fibonacci utk PETA BREAKDOWN (bukan sinyal beli):
+    - r382/r500/r618 : zona RESISTANCE — retracement NAIK dari swing low
+                       ke arah swing high. Ini area dimana rally/bounce
+                       kemungkinan mentok.
+    - r618 dobel-fungsi sbg level INVALIDASI: kalau harga closing di atas
+      ini, anggap tekanan jual mulai habis / breakdown mulai diragukan.
+    - d1272/d1618    : proyeksi DOWNSIDE — ekstensi ke BAWAH swing low,
+                       seberapa jauh longsor bisa lanjut kalau breakdown
+                       berlanjut.
+    """
+    d = sh - sl
+    return dict(
+        sh=sh, sl=sl,
+        r382=sl + 0.382 * d,
+        r500=sl + 0.500 * d,
+        r618=sl + 0.618 * d,     # invalidation level
+        d1272=sh - 1.272 * d,
+        d1618=sh - 1.618 * d,
     )
 
 
@@ -792,29 +858,74 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
     elif rs_v < -0.5:
         reasons.append(f"🔴 RS {rs_v:+.2f} — underperform IHSG")
 
-    # ── FIBONACCI ──
+    # ── MA200: konteks trend jangka panjang (INFORMASIONAL — tidak memengaruhi skor) ──
+    # Independen dari gate Ichimoku (yang menilai kondisi jangka pendek/menengah):
+    # saham bisa saja gate_passed=True (setup jangka pendek bullish) TAPI masih
+    # di bawah MA200 (gambaran besar jangka panjang masih bearish), atau sebaliknya.
+    ma200_v = f("ma200")
+    if pd.isna(ma200_v):
+        above_ma200 = None
+        reasons.append("⚪ MA200 belum tersedia (data historis <200 hari) — trend jangka panjang tidak terukur")
+    else:
+        above_ma200 = price > ma200_v
+        if above_ma200:
+            reasons.append(f"🟢 Harga di atas MA200 ({ma200_v:,.0f}) — trend jangka panjang masih sehat")
+        else:
+            reasons.append(f"🔴 Harga di BAWAH MA200 ({ma200_v:,.0f}) — trend jangka panjang bearish, ekstra hati-hati")
+
+    # ══════════════════════════════════════════════════
+    # FIBONACCI — cabang BULLISH (default) vs BEARISH (breakdown map)
+    # ══════════════════════════════════════════════════
+    # Bullish: dipakai kalau gate_passed=True (SELALU True di Screener Massal
+    #          karena require_gate=True sudah reject duluan kalau gate gagal;
+    #          logika & angka di cabang ini 100% SAMA seperti v6.4, tidak berubah).
+    # Bearish: HANYA bisa tercapai kalau require_gate=False (mode Analisa Manual)
+    #          DAN gate_passed=False — memetakan level breakdown (resistance,
+    #          invalidasi, proyeksi downside) alih-alih entry/target beli.
     lookback = adaptive_lookback(atr_pct)
-    sh, sl   = find_swing(ind["high"], ind["low"], lookback)
-    fib      = fib_levels(sh, sl)
 
-    entry_hi  = fib["f382"]
-    entry_lo  = fib["f500"]
-    entry_mid = (entry_hi + entry_lo) / 2
+    if gate_passed:
+        fib_mode = "bullish"
+        sh, sl   = find_swing(ind["high"], ind["low"], lookback)
+        fib      = fib_levels(sh, sl)
 
-    # ── STOP LOSS: technical level, tapi wajib minimal ~1.2xATR dari harga ──
-    tech_sl     = max(kijun_v, fib["f618"])
-    min_dist_sl = price - atr_v * 1.2
-    stop_loss   = min(tech_sl, min_dist_sl)
-    stop_loss   = max(stop_loss, price * 0.85)    # jangan lebih dari 15% (batas wajar)
-    stop_loss   = min(stop_loss, price * 0.995)   # WAJIB di bawah harga
+        entry_hi  = fib["f382"]
+        entry_lo  = fib["f500"]
+        entry_mid = (entry_hi + entry_lo) / 2
 
-    target1 = fib["e1272"]
-    target2 = fib["e1618"]
+        tech_sl     = max(kijun_v, fib["f618"])
+        min_dist_sl = price - atr_v * 1.2
+        stop_loss   = min(tech_sl, min_dist_sl)
+        stop_loss   = max(stop_loss, price * 0.85)
+        stop_loss   = min(stop_loss, price * 0.995)
 
-    entry_ref = max(price, entry_mid)
-    risk      = max(entry_ref - stop_loss, 1.0)
-    reward    = target1 - entry_ref
-    rr        = reward / risk
+        target1 = fib["e1272"]
+        target2 = fib["e1618"]
+
+        entry_ref = max(price, entry_mid)
+        risk      = max(entry_ref - stop_loss, 1.0)
+        reward    = target1 - entry_ref
+        rr        = reward / risk
+
+    else:
+        fib_mode = "bearish"
+        sh, sl   = find_swing_bearish(ind["high"], ind["low"], lookback)
+        fibb     = fib_levels_bearish(sh, sl)
+
+        # Field direuse dgn makna beda (dijelaskan ulang di render_analysis_content):
+        # entry_hi/entry_lo -> zona resistance; stop_loss -> level invalidasi;
+        # target1/target2   -> proyeksi downside.
+        entry_hi  = fibb["r500"]
+        entry_lo  = fibb["r382"]
+        stop_loss = fibb["r618"]     # level invalidasi breakdown
+        target1   = fibb["d1272"]
+        target2   = fibb["d1618"]
+
+        # R/R diinterpretasi sbg "kalau breakdown invalid (reclaim r618),
+        # potensi ke swing high lama vs risiko balik ke swing low."
+        risk   = max(stop_loss - sl, 1.0)
+        reward = max(sh - stop_loss, 0.0)
+        rr     = reward / risk
 
     conf   = _conf(score, MX)
     signal = _signal(score, MX, rr, adx_v)
@@ -827,6 +938,10 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
         signal = "WATCH"
 
     # ── POSITION SIZING: risk-based DENGAN cap eksposur maksimal ──
+    # Catatan: di fib_mode bearish, "stop_loss" adalah level invalidasi
+    # (di ATAS harga saat ini), jadi risk_per_sh di sini tetap dihitung
+    # jarak absolut — sizing tetap masuk akal sbg "seberapa besar posisi
+    # kalau nanti entry di level reclaim tsb", bukan entry sekarang.
     risk_rp     = modal_rp * risk_pct
     risk_per_sh = abs(price - stop_loss)
     lot_by_risk = int(risk_rp / (risk_per_sh * 100)) if risk_per_sh > 0 else 0
@@ -843,6 +958,8 @@ def screen_one(ticker: str, df_raw: pd.DataFrame,
         vol_rel=vol_r, rs=rs_v, adx=adx_v,
         trend_bars=trend_bars, cqs=float(ind["cqs"].iloc[-1]),
         chikou_bull=chikou_bull, gate_passed=gate_passed,
+        ma200=ma200_v if not pd.isna(ma200_v) else float("nan"),
+        above_ma200=above_ma200, fib_mode=fib_mode,
         sektor=sektor, lot=lot, posisi_rp=posisi_rp,
         _ind=ind,
     )
@@ -872,6 +989,7 @@ def build_chart(ticker: str, df_raw: pd.DataFrame,
     sb  = ind["senkou_b"].iloc[s]
     e20 = ind["ema20"].iloc[s]
     e50 = ind["ema50"].iloc[s]
+    ma200_s = ind["ma200"].iloc[s]   # bisa penuh NaN kalau history <200 bar — plotly skip otomatis
     adv = ind["adv20"].iloc[s]
     chikou = ind["chikou_chart"].iloc[s]
 
@@ -898,16 +1016,32 @@ def build_chart(ticker: str, df_raw: pd.DataFrame,
                              line=dict(color="#F0B90B", width=1.2)), row=1, col=1)
     fig.add_trace(go.Scatter(x=dt, y=e50, name="EMA50",
                              line=dict(color="#848E9C", width=1, dash="dot")), row=1, col=1)
+    # MA200: hanya render kalau ada nilai valid (bukan seluruhnya NaN) — hindari
+    # legend entry kosong untuk saham dgn history <200 hari
+    if ma200_s.notna().any():
+        fig.add_trace(go.Scatter(x=dt, y=ma200_s, name="MA200",
+                                 line=dict(color="#FF6EC7", width=1.4, dash="dashdot")), row=1, col=1)
     fig.add_trace(go.Scatter(x=dt, y=chikou, name="Chikou",
                              line=dict(color="#BA68C8", width=1, dash="dot")), row=1, col=1)
 
-    for val, col, lbl in [
-        (res.entry_hi,  "#00C853", f"Entry Hi 38.2%: {res.entry_hi:,.0f}"),
-        (res.entry_lo,  "#4caf50", f"Entry Lo 50%: {res.entry_lo:,.0f}"),
-        (res.stop_loss, "#FF3B30", f"Stop Loss: {res.stop_loss:,.0f}"),
-        (res.target1,   "#F0B90B", f"T1 127.2%: {res.target1:,.0f}"),
-        (res.target2,   "#FF9800", f"T2 161.8%: {res.target2:,.0f}"),
-    ]:
+    if res.fib_mode == "bearish":
+        level_defs = [
+            (res.entry_hi,  "#ffc107", f"Resistance 50%: {res.entry_hi:,.0f}"),
+            (res.entry_lo,  "#ff9800", f"Resistance 38.2%: {res.entry_lo:,.0f}"),
+            (res.stop_loss, "#00C853", f"Invalidasi 61.8%: {res.stop_loss:,.0f}"),
+            (res.target1,   "#FF3B30", f"Downside 1 (127.2%): {res.target1:,.0f}"),
+            (res.target2,   "#b71c1c", f"Downside 2 (161.8%): {res.target2:,.0f}"),
+        ]
+    else:
+        level_defs = [
+            (res.entry_hi,  "#00C853", f"Entry Hi 38.2%: {res.entry_hi:,.0f}"),
+            (res.entry_lo,  "#4caf50", f"Entry Lo 50%: {res.entry_lo:,.0f}"),
+            (res.stop_loss, "#FF3B30", f"Stop Loss: {res.stop_loss:,.0f}"),
+            (res.target1,   "#F0B90B", f"T1 127.2%: {res.target1:,.0f}"),
+            (res.target2,   "#FF9800", f"T2 161.8%: {res.target2:,.0f}"),
+        ]
+
+    for val, col, lbl in level_defs:
         fig.add_hline(y=val, row=1, col=1,
                       line=dict(color=col, width=1, dash="dash"),
                       annotation_text=f" {lbl}", annotation_position="right",
@@ -920,6 +1054,7 @@ def build_chart(ticker: str, df_raw: pd.DataFrame,
                              line=dict(color="#F0B90B", width=1, dash="dot")), row=2, col=1)
 
     sc = SIG_COLOR.get(res.signal, "#FAFAFA")
+    title_suffix = " · 🗺️ PETA BREAKDOWN" if res.fib_mode == "bearish" else ""
     fig.update_layout(
         paper_bgcolor=BG, plot_bgcolor=BG2,
         font=dict(color="#FAFAFA", size=11), height=520,
@@ -928,7 +1063,7 @@ def build_chart(ticker: str, df_raw: pd.DataFrame,
         xaxis_rangeslider_visible=False,
         title=dict(
             text=(f"<b>{ticker}</b>  {res.signal}  |  Score {res.score}/{res.score_max}  |  "
-                  f"R/R {res.rr:.1f}:1  |  {res.trend_bars} bar di atas awan"),
+                  f"R/R {res.rr:.1f}:1  |  {res.trend_bars} bar di atas awan{title_suffix}"),
             x=0.01, font=dict(color=sc, size=13),
         ),
     )
@@ -1011,18 +1146,36 @@ def render_analysis_content(res: SR, df_raw: pd.DataFrame):
     Dipakai BERSAMA oleh show_modal() (Screener Massal) dan
     render_manual_analysis() (Analisa Manual) — satu sumber kebenaran,
     supaya perilaku & tampilan selalu konsisten di kedua mode.
+
+    Label & wording metric/action-plan BERBEDA tergantung res.fib_mode:
+    - "bullish" (default, satu-satunya mode yg dipakai Screener Massal):
+      Entry Zone / Target 1&2 / Stop Loss — persis seperti v6.4, TIDAK berubah.
+    - "bearish" (hanya tercapai di Analisa Manual saat gate gagal): field
+      yang SAMA direinterpretasi sbg Resistance Zone / Proyeksi Downside /
+      Level Invalidasi — peta breakdown, BUKAN rekomendasi entry beli.
     """
     sc = SIG_COLOR.get(res.signal, "#FAFAFA")
+    is_bearish_map = (res.fib_mode == "bearish")
 
     if not res.gate_passed:
         st.warning(
             "⚠️ **Saham ini TIDAK memenuhi gate teknikal wajib** "
             "(harga di atas awan Ichimoku + Heikin Ashi hijau). "
             "Analisis di bawah tetap dihitung penuh untuk referensi, tapi "
-            "**bukan sinyal beli aktif** — level entry/target/SL bersifat "
-            "proyeksi hipotetis 'jika trend berbalik', bukan rekomendasi "
-            "entry sekarang."
+            "**bukan sinyal beli aktif**. Level di bawah ini adalah **peta "
+            "breakdown** (resistance & proyeksi downside), bukan zona entry."
         )
+
+    # ── MA200 badge — konteks jangka panjang, independen dari gate Ichimoku ──
+    if res.above_ma200 is None:
+        ma200_badge = "⚪ MA200: data historis belum cukup (<200 hari)"
+        ma200_color = "#848E9C"
+    elif res.above_ma200:
+        ma200_badge = f"🟢 Di atas MA200 ({res.ma200:,.0f})"
+        ma200_color = "#4caf50"
+    else:
+        ma200_badge = f"🔴 Di BAWAH MA200 ({res.ma200:,.0f})"
+        ma200_color = "#f44336"
 
     st.markdown(
         f"<h3 style='margin:0;'>{res.ticker} &nbsp;"
@@ -1031,7 +1184,8 @@ def render_analysis_content(res: SR, df_raw: pd.DataFrame):
         f"Score <b style='color:#fff;'>{res.score}/{res.score_max}</b> · "
         f"Conf <b style='color:{sc};'>{res.conf}</b> · "
         f"Di atas awan <b style='color:#fff;'>{res.trend_bars} bar</b> · "
-        f"Sektor: {res.sektor}</p>",
+        f"Sektor: {res.sektor} &nbsp;·&nbsp; "
+        f"<span style='color:{ma200_color};'>{ma200_badge}</span></p>",
         unsafe_allow_html=True,
     )
 
@@ -1040,15 +1194,25 @@ def render_analysis_content(res: SR, df_raw: pd.DataFrame):
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Harga", f"{res.harga:,.0f}")
-    c2.metric("Entry Zone", f"{res.entry_lo:,.0f}–{res.entry_hi:,.0f}")
-    c3.metric("Stop Loss", f"{res.stop_loss:,.0f}",
-              delta=f"{(res.stop_loss/res.harga-1)*100:.1f}%", delta_color="inverse")
-    c4.metric("Target 1", f"{res.target1:,.0f}",
-              delta=f"+{(res.target1/res.harga-1)*100:.1f}%")
-    c5.metric("Target 2", f"{res.target2:,.0f}",
-              delta=f"+{(res.target2/res.harga-1)*100:.1f}%")
-    rr_lbl = "✅ Bagus" if res.rr >= 2.0 else "⚠️ Cukup" if res.rr >= 1.5 else "❌ Buruk"
-    c6.metric("R/R", f"{res.rr:.1f}:1", delta=rr_lbl, delta_color="off")
+    if is_bearish_map:
+        c2.metric("Zona Resistance", f"{res.entry_lo:,.0f}–{res.entry_hi:,.0f}")
+        c3.metric("Level Invalidasi", f"{res.stop_loss:,.0f}",
+                  delta=f"+{(res.stop_loss/res.harga-1)*100:.1f}%", delta_color="off")
+        c4.metric("Proyeksi Downside 1", f"{res.target1:,.0f}",
+                  delta=f"{(res.target1/res.harga-1)*100:.1f}%")
+        c5.metric("Proyeksi Downside 2", f"{res.target2:,.0f}",
+                  delta=f"{(res.target2/res.harga-1)*100:.1f}%")
+        c6.metric("R/R (jika reclaim)", f"{res.rr:.1f}:1", delta_color="off")
+    else:
+        c2.metric("Entry Zone", f"{res.entry_lo:,.0f}–{res.entry_hi:,.0f}")
+        c3.metric("Stop Loss", f"{res.stop_loss:,.0f}",
+                  delta=f"{(res.stop_loss/res.harga-1)*100:.1f}%", delta_color="inverse")
+        c4.metric("Target 1", f"{res.target1:,.0f}",
+                  delta=f"+{(res.target1/res.harga-1)*100:.1f}%")
+        c5.metric("Target 2", f"{res.target2:,.0f}",
+                  delta=f"+{(res.target2/res.harga-1)*100:.1f}%")
+        rr_lbl = "✅ Bagus" if res.rr >= 2.0 else "⚠️ Cukup" if res.rr >= 1.5 else "❌ Buruk"
+        c6.metric("R/R", f"{res.rr:.1f}:1", delta=rr_lbl, delta_color="off")
 
     st.markdown("---")
     col_r, col_p = st.columns(2)
@@ -1059,13 +1223,41 @@ def render_analysis_content(res: SR, df_raw: pd.DataFrame):
             st.write(reason)
 
     with col_p:
-        st.markdown("#### 🎯 Action Plan")
-        rr_note = (
-            "✅ Setup layak trading"         if res.rr >= 2.0 else
-            "⚠️ R/R minimal, SL wajib ketat" if res.rr >= 1.5 else
-            "❌ R/R buruk — pertimbangkan skip"
-        )
-        st.markdown(f"""
+        if is_bearish_map:
+            st.markdown("#### 🗺️ Peta Breakdown")
+            st.markdown(f"""
+**📍 Swing Ref:** SH {res.sh:,.0f} *(puncak sebelum longsor)* → SL {res.sl_fib:,.0f} *(dasar saat ini)*
+
+**🟡 Zona Resistance:** {res.entry_lo:,.0f} – {res.entry_hi:,.0f}
+*(Fibo 38.2%–50% dari swing low — area rally/bounce kemungkinan mentok)*
+
+**🚧 Level Invalidasi:** {res.stop_loss:,.0f} *(Fibo 61.8%)*
+*Kalau closing di ATAS ini, anggap tekanan jual mulai habis — breakdown mulai diragukan, awasi reversal.*
+
+**📉 Proyeksi Downside 1:** {res.target1:,.0f} *(ekstensi 127.2%)*
+**📉 Proyeksi Downside 2:** {res.target2:,.0f} *(ekstensi 161.8%)*
+*Seberapa jauh longsor bisa lanjut KALAU breakdown berlanjut — bukan target jual, ini peringatan risiko.*
+
+**📐 R/R jika reclaim:** {res.rr:.1f}:1
+*(kalau harga berhasil balik ke atas level invalidasi, potensi ke swing high lama vs risiko balik ke swing low)*
+
+**💰 Sizing referensi** *(kalau nanti entry di level reclaim, risk 1% modal):*
+→ Maks **{res.lot} lot** ({res.lot * 100:,} lembar) ≈ Rp{res.posisi_rp/1_000_000:,.1f}jt
+
+**📊 ATR Harian:** {res.atr:,.0f} ({res.atr_pct:.1f}%)
+**💧 Likuiditas:** ADV Rp{res.adv_rp:,.0f}jt/hari
+**⚡ Volume:** {res.vol_rel:.1f}× ADV20
+**📈 ADX:** {res.adx:.1f}  |  **RS vs IHSG:** {res.rs:+.2f}
+**👁️ Chikou:** {"✅ Konfirmasi bullish" if res.chikou_bull else "⚠️ Belum konfirmasi"}
+""")
+        else:
+            st.markdown("#### 🎯 Action Plan")
+            rr_note = (
+                "✅ Setup layak trading"         if res.rr >= 2.0 else
+                "⚠️ R/R minimal, SL wajib ketat" if res.rr >= 1.5 else
+                "❌ R/R buruk — pertimbangkan skip"
+            )
+            st.markdown(f"""
 **📍 Swing Ref:** SH {res.sh:,.0f} → SL {res.sl_fib:,.0f}
 
 **🟢 Zona Entry:** {res.entry_lo:,.0f} – {res.entry_hi:,.0f}
@@ -1103,7 +1295,7 @@ def show_landing_page():
     st.markdown("""
 ### 👆 Klik **Jalankan Screener** di sidebar untuk memulai.
 
-**Metodologi v6.4:**
+**Metodologi v6.5:**
 | Komponen | Poin | Detail |
 |---|---|---|
 | Ichimoku | 5 | Cloud color, TK cross, Kijun support, Kijun slope, **Chikou confirm** |
@@ -1233,7 +1425,7 @@ def render_manual_analysis(sek_map: dict, modal_rp: float, risk_pct: float, max_
 # ═══════════════════════════════════════════════════════
 def main():
     st.markdown(
-        "<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v6.4</h1>",
+        "<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v6.5</h1>",
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -1304,7 +1496,7 @@ def main():
         st.markdown("---")
         st.markdown(
             f"<span style='color:#848E9C;font-size:.78rem;'>"
-            f"v6.4 · {len(all_tickers)} emiten loaded</span>",
+            f"v6.5 · {len(all_tickers)} emiten loaded</span>",
             unsafe_allow_html=True,
         )
 
