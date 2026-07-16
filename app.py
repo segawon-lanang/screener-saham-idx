@@ -151,7 +151,7 @@ def effective_signal(r: QuantResult, min_rr: float) -> str:
     return r.signal
 
 # ═══════════════════════════════════════════════════════
-# DOWNLOAD LAYER (Unchanged from v8.0)
+# DOWNLOAD LAYER
 # ═══════════════════════════════════════════════════════
 def _safe_download(ticker: str, period: str) -> Optional[pd.DataFrame]:
     for attempt in range(MAX_RETRY):
@@ -242,7 +242,7 @@ def load_emiten() -> pd.DataFrame:
         return pd.DataFrame({"ticker": [t + ".JK" for t in base], "sektor": "—"})
 
 # ═══════════════════════════════════════════════════════
-# INDICATORS & MATH (Unchanged)
+# INDICATORS & MATH
 # ═══════════════════════════════════════════════════════
 def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     ha_c = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
@@ -282,7 +282,7 @@ def compute_indicators_cached(_hash: int, df_raw: pd.DataFrame) -> Optional[dict
     if len(df_raw) < MIN_BARS: return None
     c, h, lo, o, v = df_raw["Close"], df_raw["High"], df_raw["Low"], df_raw["Open"], df_raw["Volume"]
     ichi = ichimoku_manual(h, lo, c)
-    ha = heikin_ashi(df)
+    ha = heikin_ashi(df_raw)  # FIX: df -> df_raw
     macd_hist = MACD(c).macd_diff()
     adx_obj = ADXIndicator(h, lo, c, window=14)
     srsi_k, srsi_d, rsi14 = stoch_rsi(c)
@@ -355,7 +355,7 @@ def rs_score(close, ihsg_ret, window=20):
     return float(mu / std) if std > 0 and not np.isnan(std) else 0.0
 
 # ═══════════════════════════════════════════════════════
-# TRUE QUANT ENGINE (v9.0)
+# TRUE QUANT ENGINE
 # ═══════════════════════════════════════════════════════
 def _conf(s): 
     p = s / SCORE_MAX
@@ -373,10 +373,7 @@ def _vectorized_trend_bars(close, senkou_a, senkou_b, max_bars=60):
     return count
 
 def _calc_continuous_win_prob(adx, trend_bars, above_ma200, chikou_bull, rs):
-    """
-    Sigmoid-based continuous probability mapping.
-    Replaces discrete if/else heuristics with smooth mathematical functions.
-    """
+    """Sigmoid-based continuous probability mapping using math.tanh."""
     p = 0.50
     p += math.tanh((adx - 20) / 4) * 0.15   # ADX smooth scaling
     p += math.tanh((trend_bars - 5) / 3) * 0.10 # Trend bars smooth scaling
