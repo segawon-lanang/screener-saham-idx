@@ -404,6 +404,31 @@ def _calc_kelly(win_prob, rr):
     kelly = win_prob - ((1 - win_prob) / rr)
     return max(0.0, kelly * KELLY_FRACTION)
 
+def _compute_fib_bullish(ind, price, atr_v, kijun_v):
+    sh, sl = find_swing(ind["high"], ind["low"], adaptive_lookback(atr_v/price*100))
+    fib = fib_levels(sh, sl)
+    
+    # Confluence: narrow entry if EMA20 is inside Fibo zone
+    e20 = float(ind["ema20"].iloc[-1])
+    entry_lo, entry_hi = fib["f500"], fib["f382"]
+    if entry_lo <= e20 <= entry_hi:
+        entry_lo = max(entry_lo, e20 * 0.99)
+        entry_hi = min(entry_hi, e20 * 1.01)
+        
+    stop_loss = max(kijun_v, fib["f618"])  # Strict invalidation
+    target1, target2 = fib["e1272"], fib["e1618"]
+    entry_ref = max(price, (entry_lo + entry_hi) / 2)
+    rr = (target1 - entry_ref) / max(entry_ref - stop_loss, 1.0)
+    return dict(sh=sh, sl_fib=sl, entry_hi=entry_hi, entry_lo=entry_lo, target1=target1, target2=target2, stop_loss=stop_loss, rr=rr, fib_mode="bullish")
+
+def _compute_fib_bearish(ind, price, atr_v):
+    sh, sl = find_swing_bearish(ind["high"], ind["low"], adaptive_lookback(atr_v/price*100))
+    fibb = fib_levels_bearish(sh, sl)
+    stop_loss = fibb["r618"]  # Invalidation of breakdown
+    target1, target2 = fibb["d1272"], fibb["d1618"]
+    rr = max(sh - stop_loss, 0.0) / max(stop_loss - sl, 1.0)
+    return dict(sh=sh, sl_fib=sl, entry_hi=fibb["r500"], entry_lo=fibb["r382"], target1=target1, target2=target2, stop_loss=stop_loss, rr=rr, fib_mode="bearish")
+
 def screen_one(ticker, df_raw, ihsg_ret, min_adv_rp, sektor="—", modal_rp=100_000_000, risk_pct=0.01, max_exposure_pct=0.25, require_gate=True) -> Optional[QuantResult]:
     ind = compute_indicators(df_raw)
     if ind is None: return None
@@ -528,31 +553,6 @@ def screen_one(ticker, df_raw, ihsg_ret, min_adv_rp, sektor="—", modal_rp=100_
         sektor=sektor, lot=lot, posisi_rp=posisi_rp, risk_rp=risk_rp, _chart_data=chart_data
     )
 
-def _compute_fib_bullish(ind, price, atr_v, kijun_v):
-    sh, sl = find_swing(ind["high"], ind["low"], adaptive_lookback(atr_v/price*100))
-    fib = fib_levels(sh, sl)
-    
-    # Confluence: narrow entry if EMA20 is inside Fibo zone
-    e20 = float(ind["ema20"].iloc[-1])
-    entry_lo, entry_hi = fib["f500"], fib["f382"]
-    if entry_lo <= e20 <= entry_hi:
-        entry_lo = max(entry_lo, e20 * 0.99)
-        entry_hi = min(entry_hi, e20 * 1.01)
-        
-    stop_loss = max(kijun_v, fib["f618"])  # Strict invalidation
-    target1, target2 = fib["e1272"], fib["e1618"]
-    entry_ref = max(price, (entry_lo + entry_hi) / 2)
-    rr = (target1 - entry_ref) / max(entry_ref - stop_loss, 1.0)
-    return dict(sh=sh, sl_fib=sl, entry_hi=entry_hi, entry_lo=entry_lo, target1=target1, target2=target2, stop_loss=stop_loss, rr=rr, fib_mode="bullish")
-
-def _compute_fib_bearish(ind, price, atr_v):
-    sh, sl = find_swing_bearish(ind["high"], ind["low"], adaptive_lookback(atr_v/price*100))
-    fibb = fib_levels_bearish(sh, sl)
-    stop_loss = fibb["r618"]  # Invalidation of breakdown
-    target1, target2 = fibb["d1272"], fibb["d1618"]
-    rr = max(sh - stop_loss, 0.0) / max(stop_loss - sl, 1.0)
-    return dict(sh=sh, sl_fib=sl, entry_hi=fibb["r500"], entry_lo=fibb["r382"], target1=target1, target2=target2, stop_loss=stop_loss, rr=rr, fib_mode="bearish")
-
 # ═══════════════════════════════════════════════════════
 # UI RENDERING
 # ═══════════════════════════════════════════════════════
@@ -616,4 +616,284 @@ def render_analysis_content(res: QuantResult, modal_rp=100_000_000, max_expo=0.2
 - RS vs IHSG: {res.rs:+.2f}
 """)
 
-# (Omitted UI loop functions for brevity, they follow the same pattern as v7.0 but call the new QuantResult)
+@st.dialog("📊 Trading Plan Detail", width="large")
+def show_modal(res: QuantResult, modal_rp=100_000_000, max_expo=0.25):
+    render_analysis_content(res, modal_rp, max_expo)
+
+def render_regime(regime: str, breadth: float, ratio: float):
+    cls_map = {"BULL": "regime-bull", "BEAR": "regime-bear"}
+    col_map = {"BULL": "#00e676", "BEAR": "#f44336"}
+    cls = cls_map.get(regime, "regime-neutral")
+    color = col_map.get(regime, "#ffc107")
+    trend = "🔼 EMA20 > EMA50" if ratio > 1 else "🔽 EMA20 < EMA50"
+    st.markdown(f"""
+    <div class='{cls}'>
+      <span style='font-size:1.05rem;font-weight:700;color:{color};'>
+        📊 Market Regime: {regime}
+      </span>&nbsp;&nbsp;
+      <span style='color:#848E9C;font-size:.88rem;'>
+        Breadth: <b style='color:#FAFAFA;'>{breadth:.1f}%</b> saham di atas EMA20
+        &nbsp;·&nbsp; IHSG: {trend}
+      </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+def render_kpi(results: list, min_rr: float):
+    by = {s: 0 for s in SIGNAL_ORDER}
+    for r in results:
+        by[effective_signal(r, min_rr)] += 1
+    c1, c2, c3, c4, c5 = st.columns(5)
+    for col, lbl, val, bc in [
+        (c1, "Total Lolos Gate",  str(len(results)),         "#F0B90B"),
+        (c2, "STRONG BUY",        str(by["STRONG BUY"]),     "#00e676"),
+        (c3, "BUY",               str(by["BUY"]),             "#4caf50"),
+        (c4, "WATCH",             str(by["WATCH"]),           "#ffc107"),
+        (c5, "AVOID",             str(by["AVOID"]),           "#f44336"),
+    ]:
+        col.markdown(f"<div class='kpi' style='border-color:{bc};'><div class='kpi-lbl'>{lbl}</div><div class='kpi-val' style='color:{bc};'>{val}</div></div>", unsafe_allow_html=True)
+
+def results_to_df(results_with_sig: list) -> pd.DataFrame:
+    rows = []
+    for r, eff_sig in results_with_sig:
+        rows.append({
+            "Ticker": r.ticker, "Signal": eff_sig, "Score": f"{r.score}/{r.score_max}",
+            "P_win": f"{r.win_prob*100:.0f}%", "EV (R)": f"{r.ev_r:+.2f}",
+            "Harga": f"{r.harga:,.0f}", "Entry Zone": f"{r.entry_lo:,.0f}–{r.entry_hi:,.0f}",
+            "Target 1": f"{r.target1:,.0f}", "Stop Loss": f"{r.stop_loss:,.0f}",
+            "R/R": f"{r.rr:.1f}:1", "Lot": r.lot, "Eksposur": f"Rp{r.posisi_rp/1_000_000:,.1f}jt",
+            "Sektor": r.sektor,
+        })
+    return pd.DataFrame(rows)
+
+def render_manual_analysis(sek_map: dict, modal_rp: float, risk_pct: float, max_expo: float):
+    st.markdown("### 🔍 Analisa Manual — Cek Saham Spesifik")
+    st.markdown("<p style='color:#848E9C;'>Masukkan kode ticker APAPUN. Gate wajib tidak diberlakukan di sini.</p>", unsafe_allow_html=True)
+
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        ticker_raw = st.text_input("Kode Ticker", placeholder="Contoh: BBCA, TLKM", key=SessionKeys.MANUAL_INPUT, label_visibility="collapsed")
+    with col2:
+        analyze_btn = st.button("🔎 Analisa", use_container_width=True, type="primary")
+
+    if analyze_btn and ticker_raw and ticker_raw.strip():
+        ticker = ticker_raw.strip().upper()
+        if not ticker.endswith(".JK"): ticker += ".JK"
+
+        with st.spinner(f"📡 Mengunduh & menganalisis {esc(ticker)}..."):
+            df = _safe_download(ticker, PERIOD)
+            if df is None:
+                st.session_state[SessionKeys.MANUAL_RESULT] = None
+                st.session_state[SessionKeys.MANUAL_ERROR] = f"❌ Data untuk **{esc(ticker)}** tidak ditemukan."
+            else:
+                ihsg_df = fetch_ihsg()
+                ihsg_close = ihsg_df["Close"] if not ihsg_df.empty else None
+                ihsg_ret = ihsg_close.pct_change() if ihsg_close is not None else None
+                sektor = sek_map.get(ticker, "—")
+
+                r = screen_one(ticker, df, ihsg_ret, min_adv_rp=0, sektor=sektor,
+                               modal_rp=modal_rp, risk_pct=risk_pct, max_exposure_pct=max_expo, require_gate=False)
+                if r is None:
+                    st.session_state[SessionKeys.MANUAL_RESULT] = None
+                    st.session_state[SessionKeys.MANUAL_ERROR] = f"❌ Data **{esc(ticker)}** tidak cukup untuk dianalisis."
+                else:
+                    st.session_state[SessionKeys.MANUAL_RESULT] = r
+                    st.session_state[SessionKeys.MANUAL_ERROR] = None
+
+    if st.session_state.get(SessionKeys.MANUAL_ERROR):
+        st.error(st.session_state[SessionKeys.MANUAL_ERROR])
+
+    res = st.session_state.get(SessionKeys.MANUAL_RESULT)
+    if res is not None:
+        st.markdown("---")
+        render_analysis_content(res, modal_rp, max_expo)
+    elif not st.session_state.get(SessionKeys.MANUAL_ERROR):
+        st.info("💡 Masukkan kode ticker di atas dan klik **Analisa** untuk memulai.")
+
+def render_sidebar(all_tickers: list) -> dict:
+    with st.sidebar:
+        st.markdown("## ⚙️ Konfigurasi Quant")
+        mode = st.radio("Mode", ["🚀 Screener Massal", "🔍 Analisa Manual"], key=SessionKeys.APP_MODE)
+        st.markdown("---")
+
+        config = {"mode": mode}
+
+        if mode == "🚀 Screener Massal":
+            config["n_tickers"] = st.slider("Jumlah emiten (Top N)", 10, len(all_tickers), min(200, len(all_tickers)), 10)
+            config["min_adv_rp"] = st.slider("Min Likuiditas (Rp jt/hari)", 500, 20_000, 2_000, 500)
+            config["min_rr"] = st.slider("Min R/R Ratio", 0.5, 4.0, DEFAULT_MIN_RR, 0.5)
+            config["workers"] = st.slider("Parallel workers", 2, 12, 6, 1)
+            config["chunk"] = st.slider("Ticker per request", 5, 50, CHUNK_SIZE, 5)
+            st.markdown("---")
+        else:
+            st.caption("🔍 **Mode Analisa Manual** — masukkan ticker di halaman utama.")
+            st.markdown("---")
+
+        st.markdown("**Position Sizing**")
+        config["modal_rp"] = st.number_input("Modal (Rp)", value=100_000_000, step=10_000_000, format="%d")
+        config["risk_pct"] = st.slider("Risk per trade (%)", 0.5, 3.0, 1.0, 0.5) / 100
+        config["max_expo"] = st.slider("Max eksposur per saham (%)", 10, 50, 25, 5) / 100
+
+        if mode == "🚀 Screener Massal":
+            st.markdown("---")
+            st.markdown("**Filter Tampilan**")
+            config["show_sigs"] = st.multiselect("Tampilkan sinyal:", SIGNAL_ORDER, default=["STRONG BUY", "BUY", "WATCH"])
+            st.markdown("---")
+
+        st.markdown(f"<span style='color:#848E9C;font-size:.78rem;'>v8.0 Quant · {len(all_tickers)} emiten loaded</span>", unsafe_allow_html=True)
+
+        if mode == "🚀 Screener Massal":
+            config["run_btn"] = st.button("🚀 Jalankan Screener", use_container_width=True, type="primary")
+        else:
+            config["run_btn"] = False
+
+    return config
+
+def run_screener_pipeline(target: list, sek_map: dict, config: dict) -> Optional[dict]:
+    with st.spinner("📡 Mengunduh data IHSG..."):
+        ihsg_df = fetch_ihsg()
+        ihsg_close = ihsg_df["Close"] if not ihsg_df.empty else None
+        ihsg_ret = ihsg_close.pct_change() if ihsg_close is not None else None
+
+    if ihsg_df.empty:
+        st.warning("⚠️ IHSG tidak berhasil diunduh — RS score tidak tersedia.")
+
+    info = st.empty()
+    info.info(f"⏳ Mengunduh {len(target)} emiten ({config['chunk']} ticker/request, {config['workers']} workers)...")
+
+    t0 = time.time()
+    all_dfs = fetch_all(target, PERIOD, max_workers=config["workers"], chunk_size=config["chunk"])
+    elapsed = time.time() - t0
+    n_ok = len(all_dfs)
+
+    if n_ok == 0:
+        info.error("❌ Tidak ada data berhasil diunduh. Cek koneksi atau rate-limit yfinance.")
+        return None
+
+    info.success(f"✅ {n_ok}/{len(target)} emiten berhasil diunduh dalam {elapsed:.1f}s")
+
+    def _worker(args):
+        ticker, df = args
+        sektor = sek_map.get(ticker, "—")
+        try:
+            r = screen_one(ticker, df, ihsg_ret, config["min_adv_rp"], sektor,
+                           modal_rp=config["modal_rp"], risk_pct=config["risk_pct"], max_exposure_pct=config["max_expo"])
+        except Exception as e:
+            logger.error(f"screen_one {ticker}: {e}")
+            r = None
+        above_ema = r.above_ema20 if r is not None else False
+        return r, above_ema
+
+    prog = st.progress(0.0, text="Analisis paralel...")
+    raw_results: list = []
+    above_count = total_breadth = 0
+    items = list(all_dfs.items())
+
+    with ThreadPoolExecutor(max_workers=config["workers"]) as ex:
+        futs = {ex.submit(_worker, item): item[0] for item in items}
+        done = 0
+        for fut in as_completed(futs):
+            done += 1
+            try:
+                r, above_ema = fut.result()
+                total_breadth += 1
+                if above_ema: above_count += 1
+                if r is not None: raw_results.append(r)
+            except Exception as e:
+                logger.warning(f"Worker error: {e}")
+            prog.progress(done / len(futs), text=f"Analisis {done}/{len(futs)}...")
+    prog.empty()
+
+    breadth_inline = (above_count / total_breadth * 100) if total_breadth > 0 else 50.0
+    ihsg_bull, ihsg_ratio = ihsg_trend(ihsg_df)
+    regime = decide_regime(ihsg_bull, breadth_inline)
+
+    passed_tickers = {r.ticker for r in raw_results}
+    slim_dfs = {t: all_dfs[t] for t in passed_tickers if t in all_dfs}
+
+    return dict(raw_results=raw_results, all_dfs=slim_dfs, regime=regime, breadth=breadth_inline,
+                ihsg_ratio=ihsg_ratio, n_ok=n_ok, n_target=len(target), elapsed=elapsed)
+
+def render_results(run_data: dict, config: dict):
+    raw_results = run_data["raw_results"]
+    all_dfs = run_data["all_dfs"]
+    min_rr = config["min_rr"]
+    show_sigs = config["show_sigs"]
+    modal_rp = config["modal_rp"]
+    max_expo = config["max_expo"]
+
+    render_regime(run_data["regime"], run_data["breadth"], run_data["ihsg_ratio"])
+
+    results_eff = [(r, effective_signal(r, min_rr)) for r in raw_results]
+    filtered = [(r, eff) for r, eff in results_eff if eff in show_sigs]
+    filtered.sort(key=lambda pair: (SIGNAL_ORDER.index(pair[1]), -pair[0].score))
+
+    st.markdown("")
+    render_kpi(raw_results, min_rr)
+    st.markdown(f"### 📋 Hasil — **{len(filtered)}** kandidat tampil  <span style='color:#848E9C;font-size:.85rem;'>({len(raw_results)} lolos gate dari {run_data['n_ok']} diunduh)</span>", unsafe_allow_html=True)
+
+    if not filtered:
+        st.warning("Tidak ada saham yang memenuhi kriteria. Coba turunkan filter.")
+        return
+
+    df_disp = results_to_df(filtered)
+    st.dataframe(df_disp, use_container_width=True, hide_index=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv = df_disp.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download hasil (.csv)", csv, file_name=f"ifh_quant_{ts}.csv", mime="text/csv")
+
+    st.markdown("---")
+    st.markdown("### 🔍 Action Panel — Klik ticker untuk Trading Plan lengkap")
+
+    for sig in SIGNAL_ORDER:
+        tier = [r for r, eff in filtered if eff == sig]
+        if not tier: continue
+        avg_score = sum(r.score for r in tier) / len(tier)
+        exp_label = f"{sig}  ({len(tier)} saham)  —  avg score {avg_score:.1f}/{tier[0].score_max}"
+        
+        with st.expander(exp_label, expanded=(sig in ("STRONG BUY", "BUY"))):
+            NCOLS = 5
+            rows = [tier[i: i + NCOLS] for i in range(0, len(tier), NCOLS)]
+            for row in rows:
+                cols = st.columns(NCOLS)
+                for j, r in enumerate(row):
+                    with cols[j]:
+                        if st.button(f"**{esc(r.ticker)}**\nRp{r.harga:,.0f} · R/R {r.rr:.1f}\nP_win {r.win_prob*100:.0f}% | EV {r.ev_r:+.2f}R",
+                                     key=f"btn_{r.ticker}_{sig}", use_container_width=True,
+                                     help=f"{r.conf} | ADX {r.adx:.0f} | Vol {r.vol_rel:.1f}× | RS {r.rs:+.2f}"):
+                            show_modal(r, modal_rp, max_expo)
+
+# ═══════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════
+def main():
+    st.markdown("<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v8.0 (Quant)</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='color:#848E9C;margin-top:0;'>Quant Trading System · Ichimoku · Fibonacci · Heikin Ashi · ADX · Stoch RSI · Kelly Sizing</p>", unsafe_allow_html=True)
+    st.markdown("---")
+
+    emiten_df = load_emiten()
+    all_tickers = emiten_df["ticker"].tolist()
+    sek_col = emiten_df["sektor"] if "sektor" in emiten_df.columns else pd.Series("—", index=emiten_df.index)
+    sek_map = dict(zip(emiten_df["ticker"], sek_col.fillna("—")))
+
+    config = render_sidebar(all_tickers)
+
+    if config["mode"] == "🔍 Analisa Manual":
+        render_manual_analysis(sek_map, config["modal_rp"], config["risk_pct"], config["max_expo"])
+        return
+
+    if config["run_btn"]:
+        target = all_tickers[:config["n_tickers"]]
+        run_data = run_screener_pipeline(target, sek_map, config)
+        if run_data is not None:
+            st.session_state[SessionKeys.RUN_DATA] = run_data
+
+    run_data = st.session_state.get(SessionKeys.RUN_DATA)
+    if run_data is None:
+        st.markdown("### 👆 Klik **Jalankan Screener** di sidebar untuk memulai.")
+        return
+
+    render_results(run_data, config)
+
+if __name__ == "__main__":
+    main()
