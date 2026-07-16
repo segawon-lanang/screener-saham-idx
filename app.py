@@ -1,15 +1,12 @@
 """
-Screener Ichi-Fibo-Heikin Pro  •  v8.0  (Quant Trading System Overhaul)
+Screener Ichi-Fibo-Heikin Pro  •  v9.0  (True Quant System)
 ════════════════════════════════════════════════════════════════════
-QUANT UPGRADES:
-  1. Expected Value (EV) & Win Probability: Scoring kini memperhitungkan
-     probabilitas berbasis ADX/Trend. EV < 0 = Auto AVOID.
-  2. Fractional Kelly Sizing: Ukuran posisi dihitung dari EV & R/R,
-     dimultiplier 0.25x (Quarter-Kelly) lalu dicocokkan dgn batas modal.
-  3. Strict Invalidation: Stop loss murni teknikal (Kijun/Fibo 61.8%).
-     Volatility Cap menolak saham dgn SL >15% atau <1.5%.
-  4. Vectorized Engine: Looping trend_bars dihilangkan (O(1) NumPy).
-  5. Confluence Zone: Zona entry Fibo di-filter konfluensi dgn EMA.
+TRUE QUANT UPGRADES (v8.0 -> v9.0):
+  1. Continuous Win Prob (Sigmoid): math.tanh menggantikan if/else heuristik.
+  2. Friction Model: R/R dikurangi slippage (0.2%) & komisi (0.15%).
+  3. Regime-Adjusted Kelly: Kelly = 0 jika market bearish, maksimal jika bull.
+  4. Volatility Kelly Scalar: Semakin tinggi ATR%, semakin kecil lot size.
+  5. Portfolio Heat Cap: Batas total risk portofolio (mis. max 6% modal).
 """
 
 from __future__ import annotations
@@ -17,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import html
 import logging
+import math
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,10 +34,10 @@ from ta.volatility import AverageTrueRange
 # ═══════════════════════════════════════════════════════
 # LOGGING & CONFIG
 # ═══════════════════════════════════════════════════════
-logger = logging.getLogger("ifh_quant")
+logger = logging.getLogger("ifh_quant_v9")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 
-st.set_page_config(page_title="IFH Quant v8.0", layout="wide", initial_sidebar_state="expanded", page_icon="🦅")
+st.set_page_config(page_title="IFH Quant v9.0", layout="wide", initial_sidebar_state="expanded", page_icon="🦅")
 
 st.markdown("""
 <style>
@@ -73,17 +71,21 @@ SIG_COLOR    = {"STRONG BUY": "#00e676", "BUY": "#4caf50", "WATCH": "#ffc107", "
 # Quant Thresholds
 SCORE_MAX        = 15
 DEFAULT_MIN_RR   = 1.5
-VOL_CAP_MAX      = 0.15  # Max 15% distance for Stop Loss
-VOL_CAP_MIN      = 0.015 # Min 1.5% distance
-KELLY_FRACTION   = 0.25  # Quarter-Kelly
+VOL_CAP_MAX      = 0.15
+VOL_CAP_MIN      = 0.015
+KELLY_FRACTION   = 0.25  # Max Kelly fraction in Bull market
+
+# Friction Model (Biaya Transaksi IDX)
+SLIPPAGE_PCT = 0.002  # 0.2% slippage
+COMMISSION_PCT = 0.0015 # 0.15% komisi broker
 
 # Ichimoku
 ICHI_W1, ICHI_W2, ICHI_W3 = 9, 26, 52
 
 class SessionKeys:
     RUN_DATA = "ifh_run"
+    PORTFOLIO_HEAT = "portfolio_heat"
     MANUAL_RESULT = "manual_result"
-    MANUAL_DF = "manual_df"
     MANUAL_ERROR = "manual_error"
     MANUAL_INPUT = "manual_ticker_input"
     APP_MODE = "app_mode"
@@ -111,11 +113,12 @@ class QuantResult:
     target1:    float = 0.0
     target2:    float = 0.0
     stop_loss:  float = 0.0
-    rr:         float = 0.0
+    rr:         float = 0.0      # Gross R/R
+    adj_rr:     float = 0.0      # Friction-adjusted R/R
 
     # Quant Metrics
     win_prob:   float = 0.0
-    ev_r:       float = 0.0  # Expected Value in R
+    ev_r:       float = 0.0      # EV in R (using adj_rr)
     kelly_pct:  float = 0.0
     
     # Technicals
@@ -138,16 +141,17 @@ class QuantResult:
     lot:        int   = 0
     posisi_rp:  float = 0.0
     risk_rp:    float = 0.0
+    portfolio_breach: bool = False
 
     _chart_data: Optional[dict] = field(default=None, repr=False, compare=False)
 
 def effective_signal(r: QuantResult, min_rr: float) -> str:
-    if r.rr < min_rr or r.ev_r < 0:
+    if r.adj_rr < min_rr or r.ev_r < 0 or r.lot == 0:
         return "AVOID"
     return r.signal
 
 # ═══════════════════════════════════════════════════════
-# DOWNLOAD LAYER
+# DOWNLOAD LAYER (Unchanged from v8.0)
 # ═══════════════════════════════════════════════════════
 def _safe_download(ticker: str, period: str) -> Optional[pd.DataFrame]:
     for attempt in range(MAX_RETRY):
@@ -238,7 +242,7 @@ def load_emiten() -> pd.DataFrame:
         return pd.DataFrame({"ticker": [t + ".JK" for t in base], "sektor": "—"})
 
 # ═══════════════════════════════════════════════════════
-# INDICATORS & MATH
+# INDICATORS & MATH (Unchanged)
 # ═══════════════════════════════════════════════════════
 def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     ha_c = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
@@ -247,8 +251,7 @@ def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     for i in range(1, len(df)): ha_o[i] = (ha_o[i-1] + ha_c.iloc[i-1]) / 2
     ha_o_s = pd.Series(ha_o, index=df.index)
     return pd.DataFrame({
-        "HA_O": ha_o_s, 
-        "HA_C": ha_c, 
+        "HA_O": ha_o_s, "HA_C": ha_c, 
         "HA_H": pd.concat([ha_o_s, ha_c, df["High"]], axis=1).max(axis=1), 
         "HA_L": pd.concat([ha_o_s, ha_c, df["Low"]], axis=1).min(axis=1)
     }, index=df.index)
@@ -268,46 +271,30 @@ def ichimoku_manual(high, low, close, w1=ICHI_W1, w2=ICHI_W2, w3=ICHI_W3):
     senkou_a = ((tenkan + kijun) / 2).shift(w2)
     senkou_b = ((high.rolling(w3).max() + low.rolling(w3).min()) / 2).shift(w2)
     chikou_chart = close.shift(-w2)
-    return dict(
-        tenkan=tenkan, kijun=kijun, 
-        senkou_a=senkou_a, senkou_b=senkou_b, 
-        chikou_chart=chikou_chart
-    )
+    return dict(tenkan=tenkan, kijun=kijun, senkou_a=senkou_a, senkou_b=senkou_b, chikou_chart=chikou_chart)
 
 def _df_hash(df: pd.DataFrame) -> int:
-    try: 
-        return int(hashlib.md5(pd.util.hash_pandas_object(df[["Close", "Volume"]]).values.tobytes()).hexdigest()[:12], 16)
-    except: 
-        return hash(str(df.shape))
+    try: return int(hashlib.md5(pd.util.hash_pandas_object(df[["Close", "Volume"]]).values.tobytes()).hexdigest()[:12], 16)
+    except: return hash(str(df.shape))
 
 @st.cache_data(ttl=900, show_spinner=False, max_entries=500)
 def compute_indicators_cached(_hash: int, df_raw: pd.DataFrame) -> Optional[dict]:
     if len(df_raw) < MIN_BARS: return None
     c, h, lo, o, v = df_raw["Close"], df_raw["High"], df_raw["Low"], df_raw["Open"], df_raw["Volume"]
-    
     ichi = ichimoku_manual(h, lo, c)
     ha = heikin_ashi(df)
     macd_hist = MACD(c).macd_diff()
     adx_obj = ADXIndicator(h, lo, c, window=14)
-    
     srsi_k, srsi_d, rsi14 = stoch_rsi(c)
     
     return dict(
         close=c, high=h, low=lo, open=o, volume=v,
-        tenkan=ichi["tenkan"], kijun=ichi["kijun"], 
-        senkou_a=ichi["senkou_a"], senkou_b=ichi["senkou_b"], 
-        chikou_chart=ichi["chikou_chart"],
-        ha=ha, 
-        ema20=EMAIndicator(c, window=20).ema_indicator(), 
-        ema50=EMAIndicator(c, window=50).ema_indicator(), 
-        ma200=c.rolling(200).mean(),
-        macd_hist=macd_hist, 
-        adx=adx_obj.adx(), di_plus=adx_obj.adx_pos(), di_minus=adx_obj.adx_neg(),
+        tenkan=ichi["tenkan"], kijun=ichi["kijun"], senkou_a=ichi["senkou_a"], senkou_b=ichi["senkou_b"], chikou_chart=ichi["chikou_chart"],
+        ha=ha, ema20=EMAIndicator(c, window=20).ema_indicator(), ema50=EMAIndicator(c, window=50).ema_indicator(), ma200=c.rolling(200).mean(),
+        macd_hist=macd_hist, adx=adx_obj.adx(), di_plus=adx_obj.adx_pos(), di_minus=adx_obj.adx_neg(),
         atr=AverageTrueRange(h, lo, c, window=14).average_true_range(),
         srsi_k=srsi_k, srsi_d=srsi_d, rsi14=rsi14,
-        adv20=v.rolling(20).mean(), 
-        vol_rel=v/v.rolling(20).mean().replace(0, np.nan), 
-        adv_rp=(c*v).rolling(20).mean()/1_000_000,
+        adv20=v.rolling(20).mean(), vol_rel=v/v.rolling(20).mean().replace(0, np.nan), adv_rp=(c*v).rolling(20).mean()/1_000_000,
         cqs=((c-lo)/(h-lo).replace(0, np.nan)).fillna(0.5)
     )
 
@@ -368,7 +355,7 @@ def rs_score(close, ihsg_ret, window=20):
     return float(mu / std) if std > 0 and not np.isnan(std) else 0.0
 
 # ═══════════════════════════════════════════════════════
-# QUANT SCREENER ENGINE
+# TRUE QUANT ENGINE (v9.0)
 # ═══════════════════════════════════════════════════════
 def _conf(s): 
     p = s / SCORE_MAX
@@ -385,51 +372,45 @@ def _vectorized_trend_bars(close, senkou_a, senkou_b, max_bars=60):
         else: break
     return count
 
-def _calc_win_prob(adx, trend_bars, above_ma200, chikou_bull, rs):
-    """Heuristic probability of trade success based on trend confluence."""
-    p = 0.50  # Base 50%
-    if adx >= 25: p += 0.10
-    elif adx < 20: p -= 0.10
-    if trend_bars > 10: p += 0.10
-    elif trend_bars < 3: p -= 0.10
-    if above_ma200: p += 0.05
-    if chikou_bull: p += 0.05
-    if rs > 0.5: p += 0.05
-    elif rs < -0.5: p -= 0.05
-    return np.clip(p, 0.10, 0.85)
+def _calc_continuous_win_prob(adx, trend_bars, above_ma200, chikou_bull, rs):
+    """
+    Sigmoid-based continuous probability mapping.
+    Replaces discrete if/else heuristics with smooth mathematical functions.
+    """
+    p = 0.50
+    p += math.tanh((adx - 20) / 4) * 0.15   # ADX smooth scaling
+    p += math.tanh((trend_bars - 5) / 3) * 0.10 # Trend bars smooth scaling
+    p += 0.05 if above_ma200 else -0.05
+    p += 0.05 if chikou_bull else -0.05
+    p += math.tanh(rs / 0.5) * 0.05        # RS smooth scaling
+    return np.clip(p, 0.05, 0.90)
 
-def _calc_kelly(win_prob, rr):
-    """Fractional Kelly Criterion for position sizing."""
-    if rr <= 0: return 0.0
-    kelly = win_prob - ((1 - win_prob) / rr)
-    return max(0.0, kelly * KELLY_FRACTION)
-
-def _compute_fib_bullish(ind, price, atr_v, kijun_v):
-    sh, sl = find_swing(ind["high"], ind["low"], adaptive_lookback(atr_v/price*100))
-    fib = fib_levels(sh, sl)
+def _calc_friction_adj_rr(price, target, stop_loss):
+    """Calculates R/R after slippage and commission friction."""
+    adj_entry = price * (1 + SLIPPAGE_PCT + COMMISSION_PCT)
+    adj_target = target * (1 - SLIPPAGE_PCT - COMMISSION_PCT)
+    adj_sl = stop_loss * (1 + SLIPPAGE_PCT) # Assume SL fills worse
     
-    # Confluence: narrow entry if EMA20 is inside Fibo zone
-    e20 = float(ind["ema20"].iloc[-1])
-    entry_lo, entry_hi = fib["f500"], fib["f382"]
-    if entry_lo <= e20 <= entry_hi:
-        entry_lo = max(entry_lo, e20 * 0.99)
-        entry_hi = min(entry_hi, e20 * 1.01)
-        
-    stop_loss = max(kijun_v, fib["f618"])  # Strict invalidation
-    target1, target2 = fib["e1272"], fib["e1618"]
-    entry_ref = max(price, (entry_lo + entry_hi) / 2)
-    rr = (target1 - entry_ref) / max(entry_ref - stop_loss, 1.0)
-    return dict(sh=sh, sl_fib=sl, entry_hi=entry_hi, entry_lo=entry_lo, target1=target1, target2=target2, stop_loss=stop_loss, rr=rr, fib_mode="bullish")
+    risk = adj_entry - adj_sl
+    reward = adj_target - adj_entry
+    if risk <= 0: return 0.0
+    return reward / risk
 
-def _compute_fib_bearish(ind, price, atr_v):
-    sh, sl = find_swing_bearish(ind["high"], ind["low"], adaptive_lookback(atr_v/price*100))
-    fibb = fib_levels_bearish(sh, sl)
-    stop_loss = fibb["r618"]  # Invalidation of breakdown
-    target1, target2 = fibb["d1272"], fibb["d1618"]
-    rr = max(sh - stop_loss, 0.0) / max(stop_loss - sl, 1.0)
-    return dict(sh=sh, sl_fib=sl, entry_hi=fibb["r500"], entry_lo=fibb["r382"], target1=target1, target2=target2, stop_loss=stop_loss, rr=rr, fib_mode="bearish")
+def _calc_regime_kelly(win_prob, adj_rr, atr_pct, ihsg_bull):
+    """Kelly Criterion scaled by Volatility and Market Regime."""
+    if adj_rr <= 0: return 0.0
+    base_kelly = win_prob - ((1 - win_prob) / adj_rr)
+    if base_kelly <= 0: return 0.0
+    
+    # 1. Volatility Scalar (Max 1.0 if ATR 1%, drops to 0.2 if ATR 10%)
+    vol_scalar = np.clip(2.0 / max(atr_pct, 0.5), 0.2, 1.0)
+    
+    # 2. Regime Scalar (Stop new buys in Bear, full size in Bull)
+    regime_scalar = 1.0 if ihsg_bull else 0.0
+    
+    return max(0.0, base_kelly * KELLY_FRACTION * vol_scalar * regime_scalar)
 
-def screen_one(ticker, df_raw, ihsg_ret, min_adv_rp, sektor="—", modal_rp=100_000_000, risk_pct=0.01, max_exposure_pct=0.25, require_gate=True) -> Optional[QuantResult]:
+def screen_one(ticker, df_raw, ihsg_ret, min_adv_rp, ihsg_bull, sektor="—", modal_rp=100_000_000, risk_pct=0.01, max_exposure_pct=0.25, require_gate=True) -> Optional[QuantResult]:
     ind = compute_indicators(df_raw)
     if ind is None: return None
 
@@ -506,10 +487,17 @@ def screen_one(ticker, df_raw, ihsg_ret, min_adv_rp, sektor="—", modal_rp=100_
         fib_res = _compute_fib_bullish(ind, price, atr_v, kijun_v)
         signal = "AVOID" if (adx_v < 20 and _conf(score) == "LOW") else {"VERY HIGH": "STRONG BUY", "HIGH": "BUY", "MEDIUM": "WATCH"}.get(_conf(score), "AVOID")
 
-    # ── QUANT METRICS ──
-    win_prob = _calc_win_prob(adx_v, trend_bars, above_ma200, chikou_bull, rs_v)
-    ev_r = (win_prob * fib_res["rr"]) - ((1 - win_prob) * 1.0)
-    kelly_pct = _calc_kelly(win_prob, fib_res["rr"])
+    # ── TRUE QUANT METRICS ──
+    win_prob = _calc_continuous_win_prob(adx_v, trend_bars, above_ma200, chikou_bull, rs_v)
+    
+    # Friction-Adjusted R/R
+    adj_rr = _calc_friction_adj_rr(price, fib_res["target1"], fib_res["stop_loss"])
+    
+    # EV uses Adj R/R
+    ev_r = (win_prob * adj_rr) - ((1 - win_prob) * 1.0)
+    
+    # Regime-Adjusted Kelly
+    kelly_pct = _calc_regime_kelly(win_prob, adj_rr, atr_pct, ihsg_bull)
     
     # Strict Invalidation Volatility Cap
     sl_dist = abs(price - fib_res["stop_loss"]) / price
@@ -520,12 +508,16 @@ def screen_one(ticker, df_raw, ihsg_ret, min_adv_rp, sektor="—", modal_rp=100_
 
     if ev_r < 0:
         signal = "AVOID"
-        reasons.append(f"❌ Negative Expected Value ({ev_r:.2f}R)")
+        reasons.append(f"❌ Negative Expected Value ({ev_r:.2f}R Net)")
+        
+    if kelly_pct == 0 and ihsg_bull:
+        signal = "AVOID"
+        reasons.append("❌ Kelly Criterion = 0% (Math says do not trade)")
 
-    # ── POSITION SIZING (Quarter-Kelly + Risk Cap) ──
+    # ── POSITION SIZING ──
     dynamic_risk = min(risk_pct, kelly_pct) if kelly_pct > 0 else 0.0
     risk_rp = modal_rp * dynamic_risk
-    risk_per_sh = abs(price - fib_res["stop_loss"])
+    risk_per_sh = abs(price * (1 + SLIPPAGE_PCT) - fib_res["stop_loss"] * (1 + SLIPPAGE_PCT))
     lot_by_risk = int(risk_rp / (risk_per_sh * SHARES_PER_LOT)) if risk_per_sh > 0 else 0
     lot_by_expo = int((modal_rp * max_exposure_pct) / (price * SHARES_PER_LOT))
     lot = max(0, min(lot_by_risk, lot_by_expo, MAX_LOT_CAP))
@@ -546,12 +538,34 @@ def screen_one(ticker, df_raw, ihsg_ret, min_adv_rp, sektor="—", modal_rp=100_
         ticker=ticker, harga=price, signal=signal, score=score, score_max=SCORE_MAX, conf=_conf(score), reasons=reasons,
         sh=fib_res["sh"], sl_fib=fib_res["sl_fib"], entry_hi=fib_res["entry_hi"], entry_lo=fib_res["entry_lo"],
         target1=fib_res["target1"], target2=fib_res["target2"], stop_loss=fib_res["stop_loss"], rr=fib_res["rr"],
-        win_prob=win_prob, ev_r=ev_r, kelly_pct=kelly_pct,
+        adj_rr=adj_rr, win_prob=win_prob, ev_r=ev_r, kelly_pct=kelly_pct,
         atr=atr_v, atr_pct=atr_pct, adv_rp=adv_rp_v, vol_rel=vol_r, rs=rs_v, adx=adx_v, trend_bars=trend_bars,
         chikou_bull=chikou_bull, gate_passed=gate_passed, above_ema20=price > float(ind["ema20"].iloc[-1]),
         ma200=ma200_v if not pd.isna(ma200_v) else float("nan"), above_ma200=above_ma200, fib_mode=fib_res["fib_mode"],
         sektor=sektor, lot=lot, posisi_rp=posisi_rp, risk_rp=risk_rp, _chart_data=chart_data
     )
+
+def _compute_fib_bullish(ind, price, atr_v, kijun_v):
+    sh, sl = find_swing(ind["high"], ind["low"], adaptive_lookback(atr_v/price*100))
+    fib = fib_levels(sh, sl)
+    e20 = float(ind["ema20"].iloc[-1])
+    entry_lo, entry_hi = fib["f500"], fib["f382"]
+    if entry_lo <= e20 <= entry_hi:
+        entry_lo = max(entry_lo, e20 * 0.99)
+        entry_hi = min(entry_hi, e20 * 1.01)
+    stop_loss = max(kijun_v, fib["f618"])
+    target1, target2 = fib["e1272"], fib["e1618"]
+    entry_ref = max(price, (entry_lo + entry_hi) / 2)
+    rr = (target1 - entry_ref) / max(entry_ref - stop_loss, 1.0)
+    return dict(sh=sh, sl_fib=sl, entry_hi=entry_hi, entry_lo=entry_lo, target1=target1, target2=target2, stop_loss=stop_loss, rr=rr, fib_mode="bullish")
+
+def _compute_fib_bearish(ind, price, atr_v):
+    sh, sl = find_swing_bearish(ind["high"], ind["low"], adaptive_lookback(atr_v/price*100))
+    fibb = fib_levels_bearish(sh, sl)
+    stop_loss = fibb["r618"]
+    target1, target2 = fibb["d1272"], fibb["d1618"]
+    rr = max(sh - stop_loss, 0.0) / max(stop_loss - sl, 1.0)
+    return dict(sh=sh, sl_fib=sl, entry_hi=fibb["r500"], entry_lo=fibb["r382"], target1=target1, target2=target2, stop_loss=stop_loss, rr=rr, fib_mode="bearish")
 
 # ═══════════════════════════════════════════════════════
 # UI RENDERING
@@ -576,7 +590,7 @@ def build_chart(res: QuantResult) -> go.Figure:
     
     sc = SIG_COLOR.get(res.signal, "#FAFAFA")
     fig.update_layout(paper_bgcolor="#0E1117", plot_bgcolor="#1E2329", font=dict(color="#FAFAFA", size=11), height=520, margin=dict(l=0, r=140, t=36, b=0), xaxis_rangeslider_visible=False,
-                      title=dict(text=f"<b>{esc(res.ticker)}</b> {res.signal} | Score {res.score}/{res.score_max} | R/R {res.rr:.1f} | EV {res.ev_r:.2f}R | P_win {res.win_prob*100:.0f}%", x=0.01, font=dict(color=sc, size=13)))
+                      title=dict(text=f"<b>{esc(res.ticker)}</b> {res.signal} | Net R/R {res.adj_rr:.1f} | EV {res.ev_r:.2f}R | P_win {res.win_prob*100:.0f}% | Lot {res.lot}", x=0.01, font=dict(color=sc, size=13)))
     return fig
 
 def render_analysis_content(res: QuantResult, modal_rp=100_000_000, max_expo=0.25):
@@ -584,7 +598,7 @@ def render_analysis_content(res: QuantResult, modal_rp=100_000_000, max_expo=0.2
         st.warning("⚠️ **Gate Gagal.** Analisis di bawah adalah Peta Breakdown, bukan sinyal beli aktif.")
 
     sc = SIG_COLOR.get(res.signal, "#FAFAFA")
-    st.markdown(f"<h3 style='margin:0;'>{esc(res.ticker)} <span style='color:{sc};font-size:.95rem;'>{res.signal}</span></h3><p style='color:#848E9C;margin:4px 0 10px;'>Score <b>{res.score}/{res.score_max}</b> · P_win <b>{res.win_prob*100:.0f}%</b> · EV <b>{res.ev_r:+.2f}R</b> · R/R <b>{res.rr:.1f}:1</b></p>", unsafe_allow_html=True)
+    st.markdown(f"<h3 style='margin:0;'>{esc(res.ticker)} <span style='color:{sc};font-size:.95rem;'>{res.signal}</span></h3><p style='color:#848E9C;margin:4px 0 10px;'>Score <b>{res.score}/{res.score_max}</b> · P_win <b>{res.win_prob*100:.0f}%</b> · Net EV <b>{res.ev_r:+.2f}R</b> · Adj R/R <b>{res.adj_rr:.1f}:1</b></p>", unsafe_allow_html=True)
     
     st.plotly_chart(build_chart(res), use_container_width=True, config={"displayModeBar": False})
 
@@ -603,14 +617,16 @@ def render_analysis_content(res: QuantResult, modal_rp=100_000_000, max_expo=0.2
     with col_p:
         st.markdown("#### 🎯 Quant Trading Plan")
         st.markdown(f"""
-**💰 Position Sizing (Quarter-Kelly):**
+**💰 Position Sizing (Regime-Kelly):**
 - Kelly Frac: `{res.kelly_pct*100:.1f}%`
 - Risk/Capital: `{res.risk_rp/modal_rp*100:.2f}%`
 - **Lot Size: {res.lot} lot** ({res.lot * SHARES_PER_LOT:,} lembar)
 - Eksposur: Rp{res.posisi_rp/1_000_000:,.1f}jt
 - Risk Rp: Rp{res.risk_rp/1_000_000:,.1f}jt
 
-**📊 Risk Metrics:**
+**📊 Risk Metrics (Friction-Adjusted):**
+- Gross R/R: {res.rr:.1f}:1
+- Net R/R: {res.adj_rr:.1f}:1 *(setelah slippage 0.2% & komisi 0.15%)*
 - ATR Harian: {res.atr:,.0f} ({res.atr_pct:.1f}%)
 - ADX: {res.adx:.1f}
 - RS vs IHSG: {res.rs:+.2f}
@@ -657,10 +673,10 @@ def results_to_df(results_with_sig: list) -> pd.DataFrame:
     for r, eff_sig in results_with_sig:
         rows.append({
             "Ticker": r.ticker, "Signal": eff_sig, "Score": f"{r.score}/{r.score_max}",
-            "P_win": f"{r.win_prob*100:.0f}%", "EV (R)": f"{r.ev_r:+.2f}",
-            "Harga": f"{r.harga:,.0f}", "Entry Zone": f"{r.entry_lo:,.0f}–{r.entry_hi:,.0f}",
+            "P_win": f"{r.win_prob*100:.0f}%", "Net EV (R)": f"{r.ev_r:+.2f}",
+            "Net R/R": f"{r.adj_rr:.1f}", "Harga": f"{r.harga:,.0f}", 
             "Target 1": f"{r.target1:,.0f}", "Stop Loss": f"{r.stop_loss:,.0f}",
-            "R/R": f"{r.rr:.1f}:1", "Lot": r.lot, "Eksposur": f"Rp{r.posisi_rp/1_000_000:,.1f}jt",
+            "Lot": r.lot, "Risk Rp(jt)": f"{r.risk_rp/1_000_000:,.1f}",
             "Sektor": r.sektor,
         })
     return pd.DataFrame(rows)
@@ -681,16 +697,17 @@ def render_manual_analysis(sek_map: dict, modal_rp: float, risk_pct: float, max_
 
         with st.spinner(f"📡 Mengunduh & menganalisis {esc(ticker)}..."):
             df = _safe_download(ticker, PERIOD)
+            ihsg_df = fetch_ihsg()
+            ihsg_bull, _ = ihsg_trend(ihsg_df)
             if df is None:
                 st.session_state[SessionKeys.MANUAL_RESULT] = None
                 st.session_state[SessionKeys.MANUAL_ERROR] = f"❌ Data untuk **{esc(ticker)}** tidak ditemukan."
             else:
-                ihsg_df = fetch_ihsg()
                 ihsg_close = ihsg_df["Close"] if not ihsg_df.empty else None
                 ihsg_ret = ihsg_close.pct_change() if ihsg_close is not None else None
                 sektor = sek_map.get(ticker, "—")
 
-                r = screen_one(ticker, df, ihsg_ret, min_adv_rp=0, sektor=sektor,
+                r = screen_one(ticker, df, ihsg_ret, min_adv_rp=0, ihsg_bull=ihsg_bull, sektor=sektor,
                                modal_rp=modal_rp, risk_pct=risk_pct, max_exposure_pct=max_expo, require_gate=False)
                 if r is None:
                     st.session_state[SessionKeys.MANUAL_RESULT] = None
@@ -711,7 +728,7 @@ def render_manual_analysis(sek_map: dict, modal_rp: float, risk_pct: float, max_
 
 def render_sidebar(all_tickers: list) -> dict:
     with st.sidebar:
-        st.markdown("## ⚙️ Konfigurasi Quant")
+        st.markdown("## ⚙️ Konfigurasi Quant v9.0")
         mode = st.radio("Mode", ["🚀 Screener Massal", "🔍 Analisa Manual"], key=SessionKeys.APP_MODE)
         st.markdown("---")
 
@@ -720,7 +737,7 @@ def render_sidebar(all_tickers: list) -> dict:
         if mode == "🚀 Screener Massal":
             config["n_tickers"] = st.slider("Jumlah emiten (Top N)", 10, len(all_tickers), min(200, len(all_tickers)), 10)
             config["min_adv_rp"] = st.slider("Min Likuiditas (Rp jt/hari)", 500, 20_000, 2_000, 500)
-            config["min_rr"] = st.slider("Min R/R Ratio", 0.5, 4.0, DEFAULT_MIN_RR, 0.5)
+            config["min_rr"] = st.slider("Min Net R/R Ratio", 0.5, 4.0, DEFAULT_MIN_RR, 0.5)
             config["workers"] = st.slider("Parallel workers", 2, 12, 6, 1)
             config["chunk"] = st.slider("Ticker per request", 5, 50, CHUNK_SIZE, 5)
             st.markdown("---")
@@ -730,8 +747,11 @@ def render_sidebar(all_tickers: list) -> dict:
 
         st.markdown("**Position Sizing**")
         config["modal_rp"] = st.number_input("Modal (Rp)", value=100_000_000, step=10_000_000, format="%d")
-        config["risk_pct"] = st.slider("Risk per trade (%)", 0.5, 3.0, 1.0, 0.5) / 100
+        config["risk_pct"] = st.slider("Max Risk per trade (%)", 0.5, 3.0, 1.0, 0.5) / 100
         config["max_expo"] = st.slider("Max eksposur per saham (%)", 10, 50, 25, 5) / 100
+        
+        # Portfolio Heat Cap
+        config["max_port_risk"] = st.slider("Max Portfolio Heat (%)", 2.0, 15.0, 6.0, 0.5) / 100
 
         if mode == "🚀 Screener Massal":
             st.markdown("---")
@@ -739,7 +759,7 @@ def render_sidebar(all_tickers: list) -> dict:
             config["show_sigs"] = st.multiselect("Tampilkan sinyal:", SIGNAL_ORDER, default=["STRONG BUY", "BUY", "WATCH"])
             st.markdown("---")
 
-        st.markdown(f"<span style='color:#848E9C;font-size:.78rem;'>v8.0 Quant · {len(all_tickers)} emiten loaded</span>", unsafe_allow_html=True)
+        st.markdown(f"<span style='color:#848E9C;font-size:.78rem;'>v9.0 True Quant · {len(all_tickers)} emiten loaded</span>", unsafe_allow_html=True)
 
         if mode == "🚀 Screener Massal":
             config["run_btn"] = st.button("🚀 Jalankan Screener", use_container_width=True, type="primary")
@@ -753,6 +773,7 @@ def run_screener_pipeline(target: list, sek_map: dict, config: dict) -> Optional
         ihsg_df = fetch_ihsg()
         ihsg_close = ihsg_df["Close"] if not ihsg_df.empty else None
         ihsg_ret = ihsg_close.pct_change() if ihsg_close is not None else None
+        ihsg_bull, _ = ihsg_trend(ihsg_df)
 
     if ihsg_df.empty:
         st.warning("⚠️ IHSG tidak berhasil diunduh — RS score tidak tersedia.")
@@ -775,7 +796,7 @@ def run_screener_pipeline(target: list, sek_map: dict, config: dict) -> Optional
         ticker, df = args
         sektor = sek_map.get(ticker, "—")
         try:
-            r = screen_one(ticker, df, ihsg_ret, config["min_adv_rp"], sektor,
+            r = screen_one(ticker, df, ihsg_ret, config["min_adv_rp"], ihsg_bull, sektor,
                            modal_rp=config["modal_rp"], risk_pct=config["risk_pct"], max_exposure_pct=config["max_expo"])
         except Exception as e:
             logger.error(f"screen_one {ticker}: {e}")
@@ -807,11 +828,43 @@ def run_screener_pipeline(target: list, sek_map: dict, config: dict) -> Optional
     ihsg_bull, ihsg_ratio = ihsg_trend(ihsg_df)
     regime = decide_regime(ihsg_bull, breadth_inline)
 
-    passed_tickers = {r.ticker for r in raw_results}
+    # ── PORTFOLIO HEAT CAP CALCULATION ──
+    # Sort by EV descending to prioritize best trades
+    raw_results.sort(key=lambda x: x.ev_r, reverse=True)
+    
+    max_port_risk_rp = config["modal_rp"] * config["max_port_risk"]
+    current_port_risk = 0.0
+    
+    for r in raw_results:
+        if r.signal in ("STRONG BUY", "BUY", "WATCH") and r.risk_rp > 0:
+            if current_port_risk + r.risk_rp > max_port_risk_rp:
+                # Truncate or zero out position
+                remaining_risk = max_port_risk_rp - current_port_risk
+                if remaining_risk > 0:
+                    # Resize lot to fit remaining portfolio heat
+                    r.lot = int(remaining_risk / (abs(r.harga - r.stop_loss) * SHARES_PER_LOT))
+                    r.risk_rp = r.lot * abs(r.harga - r.stop_loss) * SHARES_PER_LOT
+                    r.posisi_rp = r.lot * r.harga * SHARES_PER_LOT
+                    current_port_risk += r.risk_rp
+                    r.portfolio_breach = True
+                    r.reasons.append(f"⚠️ Portfolio Heat Cap Active: Lot dipangkas ke {r.lot} (sisa risk portofolio).")
+                else:
+                    # No risk left
+                    r.lot = 0
+                    r.posisi_rp = 0.0
+                    r.risk_rp = 0.0
+                    r.portfolio_breach = True
+                    if r.signal in ("STRONG BUY", "BUY"): 
+                        r.signal = "AVOID"
+                        r.reasons.append("❌ Portfolio Heat Cap Penuh: Tidak ada alokasi risiko tersisa.")
+            else:
+                current_port_risk += r.risk_rp
+
+    passed_tickers = {r.ticker for r in raw_results if r.lot > 0 or not r.gate_passed}
     slim_dfs = {t: all_dfs[t] for t in passed_tickers if t in all_dfs}
 
     return dict(raw_results=raw_results, all_dfs=slim_dfs, regime=regime, breadth=breadth_inline,
-                ihsg_ratio=ihsg_ratio, n_ok=n_ok, n_target=len(target), elapsed=elapsed)
+                ihsg_ratio=ihsg_ratio, n_ok=n_ok, n_target=len(target), elapsed=elapsed, total_risk=current_port_risk)
 
 def render_results(run_data: dict, config: dict):
     raw_results = run_data["raw_results"]
@@ -829,7 +882,9 @@ def render_results(run_data: dict, config: dict):
 
     st.markdown("")
     render_kpi(raw_results, min_rr)
-    st.markdown(f"### 📋 Hasil — **{len(filtered)}** kandidat tampil  <span style='color:#848E9C;font-size:.85rem;'>({len(raw_results)} lolos gate dari {run_data['n_ok']} diunduh)</span>", unsafe_allow_html=True)
+    
+    total_risk_rp = run_data.get("total_risk", 0.0)
+    st.markdown(f"### 📋 Hasil — **{len(filtered)}** kandidat tampil  <span style='color:#848E9C;font-size:.85rem;'>({len(raw_results)} lolos gate dari {run_data['n_ok']} diunduh) | Total Portfolio Risk: **Rp{total_risk_rp/1_000_000:.1f}jt** ({total_risk_rp/modal_rp*100:.1f}%)</span>", unsafe_allow_html=True)
 
     if not filtered:
         st.warning("Tidak ada saham yang memenuhi kriteria. Coba turunkan filter.")
@@ -840,7 +895,7 @@ def render_results(run_data: dict, config: dict):
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv = df_disp.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download hasil (.csv)", csv, file_name=f"ifh_quant_{ts}.csv", mime="text/csv")
+    st.download_button("⬇️ Download hasil (.csv)", csv, file_name=f"ifh_quant_v9_{ts}.csv", mime="text/csv")
 
     st.markdown("---")
     st.markdown("### 🔍 Action Panel — Klik ticker untuk Trading Plan lengkap")
@@ -858,17 +913,20 @@ def render_results(run_data: dict, config: dict):
                 cols = st.columns(NCOLS)
                 for j, r in enumerate(row):
                     with cols[j]:
-                        if st.button(f"**{esc(r.ticker)}**\nRp{r.harga:,.0f} · R/R {r.rr:.1f}\nP_win {r.win_prob*100:.0f}% | EV {r.ev_r:+.2f}R",
-                                     key=f"btn_{r.ticker}_{sig}", use_container_width=True,
-                                     help=f"{r.conf} | ADX {r.adx:.0f} | Vol {r.vol_rel:.1f}× | RS {r.rs:+.2f}"):
+                        btn_label = f"**{esc(r.ticker)}**\nRp{r.harga:,.0f} | Lot: {r.lot}\nNet EV {r.ev_r:+.2f}R"
+                        if r.portfolio_breach:
+                            btn_label = "⚠️ CAP TRUNCATED\n" + btn_label
+                            
+                        if st.button(btn_label, key=f"btn_{r.ticker}_{sig}", use_container_width=True,
+                                     help=f"Net R/R: {r.adj_rr:.1f} | P_win: {r.win_prob*100:.0f}% | ADX {r.adx:.0f}"):
                             show_modal(r, modal_rp, max_expo)
 
 # ═══════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════
 def main():
-    st.markdown("<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v8.0 (Quant)</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='color:#848E9C;margin-top:0;'>Quant Trading System · Ichimoku · Fibonacci · Heikin Ashi · ADX · Stoch RSI · Kelly Sizing</p>", unsafe_allow_html=True)
+    st.markdown("<h1 style='margin-bottom:2px;'>🦅 Ichi-Fibo-Heikin Pro v9.0 (True Quant)</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='color:#848E9C;margin-top:0;'>Quant Trading System · Continuous Probabilities · Friction Model · Portfolio Heat · Kelly Criterion</p>", unsafe_allow_html=True)
     st.markdown("---")
 
     emiten_df = load_emiten()
