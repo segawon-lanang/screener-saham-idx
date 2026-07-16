@@ -246,7 +246,12 @@ def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     ha_o[0] = (df["Open"].iloc[0] + df["Close"].iloc[0]) / 2
     for i in range(1, len(df)): ha_o[i] = (ha_o[i-1] + ha_c.iloc[i-1]) / 2
     ha_o_s = pd.Series(ha_o, index=df.index)
-    return pd.DataFrame({"HA_O": ha_o_s, "HA_C": ha_c, "HA_H": pd.concat([ha_o_s, ha_c, df["High"]], axis=1).max(axis=1), "HA_L": pd.concat([ha_o_s, ha_c, df["Low"]], axis=1).min(axis=1)}, index=df.index)
+    return pd.DataFrame({
+        "HA_O": ha_o_s, 
+        "HA_C": ha_c, 
+        "HA_H": pd.concat([ha_o_s, ha_c, df["High"]], axis=1).max(axis=1), 
+        "HA_L": pd.concat([ha_o_s, ha_c, df["Low"]], axis=1).min(axis=1)
+    }, index=df.index)
 
 def stoch_rsi(close: pd.Series, rsi_p=14, stoch_p=14, k_s=3, d_s=3):
     delta = close.diff()
@@ -260,29 +265,51 @@ def stoch_rsi(close: pd.Series, rsi_p=14, stoch_p=14, k_s=3, d_s=3):
 def ichimoku_manual(high, low, close, w1=ICHI_W1, w2=ICHI_W2, w3=ICHI_W3):
     tenkan = (high.rolling(w1).max() + low.rolling(w1).min()) / 2
     kijun  = (high.rolling(w2).max() + low.rolling(w2).min()) / 2
-    return dict(tenkan=tenkan, kijun=kijun, senkou_a=((tenkan+kijun)/2).shift(w2), senkou_b=(high.rolling(w3).max()+low.rolling(w3).min())/2).shift(w2), chikou_chart=close.shift(-w2))
+    senkou_a = ((tenkan + kijun) / 2).shift(w2)
+    senkou_b = ((high.rolling(w3).max() + low.rolling(w3).min()) / 2).shift(w2)
+    chikou_chart = close.shift(-w2)
+    return dict(
+        tenkan=tenkan, kijun=kijun, 
+        senkou_a=senkou_a, senkou_b=senkou_b, 
+        chikou_chart=chikou_chart
+    )
 
 def _df_hash(df: pd.DataFrame) -> int:
-    try: return int(hashlib.md5(pd.util.hash_pandas_object(df[["Close", "Volume"]]).values.tobytes()).hexdigest()[:12], 16)
-    except: return hash(str(df.shape))
+    try: 
+        return int(hashlib.md5(pd.util.hash_pandas_object(df[["Close", "Volume"]]).values.tobytes()).hexdigest()[:12], 16)
+    except: 
+        return hash(str(df.shape))
 
 @st.cache_data(ttl=900, show_spinner=False, max_entries=500)
 def compute_indicators_cached(_hash: int, df_raw: pd.DataFrame) -> Optional[dict]:
     if len(df_raw) < MIN_BARS: return None
     c, h, lo, o, v = df_raw["Close"], df_raw["High"], df_raw["Low"], df_raw["Open"], df_raw["Volume"]
+    
     ichi = ichimoku_manual(h, lo, c)
     ha = heikin_ashi(df)
     macd_hist = MACD(c).macd_diff()
     adx_obj = ADXIndicator(h, lo, c, window=14)
     
-    return dict(close=c, high=h, low=lo, open=o, volume=v,
-                tenkan=ichi["tenkan"], kijun=ichi["kijun"], senkou_a=ichi["senkou_a"], senkou_b=ichi["senkou_b"], chikou_chart=ichi["chikou_chart"],
-                ha=ha, ema20=EMAIndicator(c, window=20).ema_indicator(), ema50=EMAIndicator(c, window=50).ema_indicator(), ma200=c.rolling(200).mean(),
-                macd_hist=macd_hist, adx=adx_obj.adx(), di_plus=adx_obj.adx_pos(), di_minus=adx_obj.adx_neg(),
-                atr=AverageTrueRange(h, lo, c, window=14).average_true_range(),
-                srsi_k, srsi_d, _ = stoch_rsi(c),
-                adv20=v.rolling(20).mean(), vol_rel=v/v.rolling(20).mean().replace(0, np.nan), adv_rp=(c*v).rolling(20).mean()/1_000_000,
-                cqs=((c-lo)/(h-lo).replace(0, np.nan)).fillna(0.5))
+    srsi_k, srsi_d, rsi14 = stoch_rsi(c)
+    
+    return dict(
+        close=c, high=h, low=lo, open=o, volume=v,
+        tenkan=ichi["tenkan"], kijun=ichi["kijun"], 
+        senkou_a=ichi["senkou_a"], senkou_b=ichi["senkou_b"], 
+        chikou_chart=ichi["chikou_chart"],
+        ha=ha, 
+        ema20=EMAIndicator(c, window=20).ema_indicator(), 
+        ema50=EMAIndicator(c, window=50).ema_indicator(), 
+        ma200=c.rolling(200).mean(),
+        macd_hist=macd_hist, 
+        adx=adx_obj.adx(), di_plus=adx_obj.adx_pos(), di_minus=adx_obj.adx_neg(),
+        atr=AverageTrueRange(h, lo, c, window=14).average_true_range(),
+        srsi_k=srsi_k, srsi_d=srsi_d, rsi14=rsi14,
+        adv20=v.rolling(20).mean(), 
+        vol_rel=v/v.rolling(20).mean().replace(0, np.nan), 
+        adv_rp=(c*v).rolling(20).mean()/1_000_000,
+        cqs=((c-lo)/(h-lo).replace(0, np.nan)).fillna(0.5)
+    )
 
 def compute_indicators(df_raw: pd.DataFrame) -> Optional[dict]:
     return compute_indicators_cached(_df_hash(df_raw), df_raw)
